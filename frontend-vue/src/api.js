@@ -146,6 +146,30 @@ export async function chatHistoryReset() {
   return jfetch('/py-api/api/chat/history/reset', { method: 'POST' })
 }
 
+/** 切换到指定历史会话：之后的续聊（档案+记忆）都落在该会话 */
+export async function chatHistoryActivate(session) {
+  return jfetch(`/py-api/api/chat/history/activate/${encodeURIComponent(session)}`, { method: 'POST' })
+}
+
 export async function chatHistoryDelete(session) {
   return jfetch(`/py-api/api/chat/history/${encodeURIComponent(session)}`, { method: 'DELETE' })
+}
+
+// ---------- 知识库管理（仅 ADMIN） ----------
+
+export async function kbList() {
+  return jfetch('/py-api/api/admin/kb')
+}
+
+/** 上传知识库文件：name=文件名，contentB64=文件内容 base64（md 顶部可用 dept_tags 声明可见性） */
+export async function kbUpload(name, contentB64) {
+  return jfetch('/py-api/api/admin/kb/upload', { method: 'POST', body: JSON.stringify({ name, content: contentB64 }) })
+}
+
+export async function kbDelete(file) {
+  return jfetch(`/py-api/api/admin/kb?file=${encodeURIComponent(file)}`, { method: 'DELETE' })
+}
+
+export async function kbReingest() {
+  return jfetch('/py-api/api/admin/kb/reingest', { method: 'POST' })
 }
