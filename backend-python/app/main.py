@@ -7,7 +7,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from . import config
 from .middleware import auth_middleware
-from .routers import chat, history
+from .routers import chat, history, kb
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 logger = logging.getLogger(__name__)
@@ -23,10 +23,12 @@ async def lifespan(_: FastAPI):
 
 app = FastAPI(title="resv-agent", version="0.1.0", lifespan=lifespan)
 
+# 认证走 Authorization 头（Bearer），不依赖 Cookie，因此 allow_credentials 必须为 False。
+# 注意：allow_origins=["*"] 与 allow_credentials=True 是浏览器拒绝的非法组合，不能同时开。
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_credentials=True,
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -34,6 +36,7 @@ app.middleware("http")(auth_middleware)
 
 app.include_router(chat.router)
 app.include_router(history.router)
+app.include_router(kb.router)
 
 
 @app.get("/api/health")

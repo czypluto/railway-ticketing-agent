@@ -60,7 +60,9 @@ public class SecurityConfig {
         cfg.setAllowedOriginPatterns(List.of("*"));
         cfg.setAllowedMethods(List.of("GET", "POST", "PUT", "DELETE", "OPTIONS"));
         cfg.setAllowedHeaders(List.of("*"));
-        cfg.setAllowCredentials(true);
+        // 认证走 Authorization 头（Bearer），不依赖 Cookie，因此不需要携带凭证。
+        // 关掉 allowCredentials 后，"任意源 + 带凭证"这一组合不再成立，避免跨站带凭证请求。
+        cfg.setAllowCredentials(false);
         UrlBasedCorsConfigurationSource source = new UrlBasedCorsConfigurationSource();
         source.registerCorsConfiguration("/**", cfg);
         return source;
