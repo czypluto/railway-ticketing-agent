@@ -7,6 +7,8 @@
 """
 import json
 import logging
+import os
+import threading
 import time
 import uuid
 from pathlib import Path
@@ -17,6 +19,18 @@ logger = logging.getLogger(__name__)
 
 ROOT = Path(__file__).resolve().parent.parent.parent / "data" / "chat_hist"
 _CURRENT = ROOT / "_current.json"
+
+# 会话档案是「整份读出 → 改 → 整份写回」的 JSON 文件，同一用户并发对话会互相覆盖，
+# 表现为丢轮次。单实例 uvicorn 下用进程内锁串行化即可；
+# 若将来多实例部署，要换成文件锁，或干脆改成追加式存储（每轮一行 JSONL）。
+_LOCK = threading.Lock()
+
+
+def _atomic_write(p: Path, text: str) -> None:
+    """先写临时文件再原子替换，避免进程在写到一半时中断留下半截 JSON。"""
+    tmp = p.with_name(p.name + f".tmp{os.getpid()}")
+    tmp.write_text(text, encoding="utf-8")
+    os.replace(tmp, p)
 
 
 def _path(user_id, session):
@@ -38,13 +52,14 @@ def _read_current(user_id):
 
 def _write_current(user_id, session):
     _ensure_dir()
-    d = {}
-    try:
-        d = json.loads(_CURRENT.read_text(encoding="utf-8"))
-    except Exception:  # noqa: BLE001
-        pass
-    d[str(user_id)] = session
-    _CURRENT.write_text(json.dumps(d, ensure_ascii=False), encoding="utf-8")
+    with _LOCK:
+        d = {}
+        try:
+            d = json.loads(_CURRENT.read_text(encoding="utf-8"))
+        except Exception:  # noqa: BLE001
+            pass
+        d[str(user_id)] = session
+        _atomic_write(_CURRENT, json.dumps(d, ensure_ascii=False))
 
 
 def current_session(user_id) -> str:
@@ -57,9 +72,8 @@ def current_session(user_id) -> str:
 def new_session(user_id) -> str:
     _ensure_dir()
     s = f"s{uuid.uuid4().hex[:10]}"
-    (ROOT / f"{user_id}_{s}.json").write_text(
-        json.dumps({"startedAt": time.time(), "messages": []}, ensure_ascii=False),
-        encoding="utf-8")
+    _atomic_write(ROOT / f"{user_id}_{s}.json",
+                  json.dumps({"startedAt": time.time(), "messages": []}, ensure_ascii=False))
     _write_current(user_id, s)
     # 记忆已按会话隔离：新会话自带空桶，这里不再清整用户记忆（旧会话切回仍可继续）
     return s
@@ -80,14 +94,15 @@ def append_turn(user_id, user_text: str, assistant_text: str):
     _ensure_dir()
     session = current_session(user_id)
     p = _path(user_id, session)
-    try:
-        doc = json.loads(p.read_text(encoding="utf-8"))
-    except Exception:  # noqa: BLE001
-        doc = {"startedAt": time.time(), "messages": []}
-    doc["messages"].append({"role": "user", "text": user_text, "ts": time.time()})
-    if assistant_text:
-        doc["messages"].append({"role": "assistant", "text": assistant_text, "ts": time.time()})
-    p.write_text(json.dumps(doc, ensure_ascii=False), encoding="utf-8")
+    with _LOCK:
+        try:
+            doc = json.loads(p.read_text(encoding="utf-8"))
+        except Exception:  # noqa: BLE001
+            doc = {"startedAt": time.time(), "messages": []}
+        doc["messages"].append({"role": "user", "text": user_text, "ts": time.time()})
+        if assistant_text:
+            doc["messages"].append({"role": "assistant", "text": assistant_text, "ts": time.time()})
+        _atomic_write(p, json.dumps(doc, ensure_ascii=False))
 
 
 def list_sessions(user_id) -> list[dict]:
@@ -118,13 +133,14 @@ def delete_session(user_id, session):
         p.unlink()
     mem.clear(user_id, session)  # 会话级记忆一并清掉，避免孤儿桶
     if _read_current(user_id) == session:
-        d = {}
-        try:
-            d = json.loads(_CURRENT.read_text(encoding="utf-8"))
-        except Exception:  # noqa: BLE001
-            pass
-        d.pop(str(user_id), None)
-        _CURRENT.write_text(json.dumps(d, ensure_ascii=False), encoding="utf-8")
+        with _LOCK:
+            d = {}
+            try:
+                d = json.loads(_CURRENT.read_text(encoding="utf-8"))
+            except Exception:  # noqa: BLE001
+                pass
+            d.pop(str(user_id), None)
+            _atomic_write(_CURRENT, json.dumps(d, ensure_ascii=False))
 
 
 def get_session(user_id, session) -> list[dict]:
