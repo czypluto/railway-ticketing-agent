@@ -1,7 +1,7 @@
 <script setup>
 import { nextTick, reactive, ref } from 'vue'
 import { ElMessage } from 'element-plus'
-import { chatHistoryDelete, chatHistoryDetail, chatHistoryList, chatHistoryReset, chatStream, clearToken } from '../api'
+import { chatHistoryActivate, chatHistoryDelete, chatHistoryDetail, chatHistoryList, chatHistoryReset, chatStream, clearToken } from '../api'
 
 const props = defineProps({
   user: { type: Object, required: true },
@@ -39,21 +39,15 @@ async function send(text) {
   messages.push(current)
   scrollBottom()
 
+  // 后端实际推送的事件类型：think / result / answer / confirm / error
+  // （见 backend-python/app/agent/orchestrator.py 中的 _event 调用）
   const onEvent = (ev) => {
     if (ev.kind === 'think') {
       current.stage = '正在为您办理…'
-    } else if (ev.kind === 'check') {
-      current.stage = '正在校验预约权限…'
-    } else if (ev.kind === 'act') {
-      current.stage = '正在抢票…'
     } else if (ev.kind === 'error') {
       current.stage = ''
       current.text = ev.text
       current.tone = 'error'
-    } else if (ev.kind === 'denied') {
-      current.stage = ''
-      current.text = ev.text
-      current.tone = 'denied'
     } else if (ev.kind === 'confirm') {
       current.stage = ''
       current.text = current.text ? `${current.text}\n${ev.text}` : ev.text
@@ -119,6 +113,29 @@ async function loadSession(s) {
     const d = await chatHistoryDetail(s.id)
     replay.value = d.messages || []
     replayTitle.value = s.preview || s.id
+  } catch (e) {
+    ElMessage.error(e.message)
+  }
+}
+
+/** “继续此会话”：激活该会话并把其历史载入主对话区，后续发送都写入该会话 */
+async function continueSession(s) {
+  try {
+    await chatHistoryActivate(s.id)
+    const d = await chatHistoryDetail(s.id)
+    messages.length = 0
+    for (const m of d.messages || []) {
+      messages.push({
+        role: m.role === 'user' ? 'user' : 'assistant',
+        text: m.text || '',
+        stage: '',
+        tone: 'normal',
+        model: ''
+      })
+    }
+    historyVisible.value = false
+    scrollBottom()
+    ElMessage.success(`已切换至该会话，续聊会写入「${s.preview || s.id}」`)
   } catch (e) {
     ElMessage.error(e.message)
   }
@@ -213,7 +230,10 @@ async function newConversation() {
                 <div class="hist-t">{{ s.preview || s.id }}</div>
                 <div class="hist-m">{{ s.count }} 轮 · {{ new Date(s.startedAt * 1000).toLocaleString() }}</div>
               </button>
-              <el-button class="hist-del" size="small" type="danger" text @click.stop="removeSession(s)">删</el-button>
+              <div class="hist-ops">
+                <el-button class="hist-go" size="small" type="primary" text @click.stop="continueSession(s)">继续</el-button>
+                <el-button class="hist-del" size="small" type="danger" text @click.stop="removeSession(s)">删</el-button>
+              </div>
             </div>
             <div v-if="!sessions.length" class="hist-empty">暂无历史对话</div>
           </div>
@@ -381,7 +401,17 @@ async function newConversation() {
   cursor: pointer;
   padding: 4px;
 }
+.hist-ops {
+  flex: none;
+  display: inline-flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 0;
+}
 .hist-del {
+  flex: none;
+}
+.hist-go {
   flex: none;
 }
 .hist-t {
