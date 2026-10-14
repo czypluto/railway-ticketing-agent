@@ -18,7 +18,8 @@ end
 
 local elapsed = now - last
 if elapsed < 0 then elapsed = 0 end
-tokens = tokens + elapsed * rate
+-- now/last 是毫秒，rate 是「每秒」补充量：必须除以 1000，否则令牌补充快 1000 倍、限流失效
+tokens = tokens + (elapsed / 1000) * rate
 if tokens > capacity then tokens = capacity end
 
 local allowed = 0
