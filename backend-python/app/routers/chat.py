@@ -32,7 +32,8 @@ async def _stream(body: ChatBody):
         uid = None
     try:
         async for ev in _agent.handle(body.message):
-            if ev.get("kind") in ("result", "answer", "confirm", "denied"):
+            # 归档只收「有内容的终态」事件；实际会出现的 kind 只有 think/result/answer/confirm/error
+            if ev.get("kind") in ("result", "answer", "confirm"):
                 last = ev.get("text")
                 lines.append(ev.get("text") or "")
             yield f"data: {json.dumps(ev, ensure_ascii=False)}\n\n"

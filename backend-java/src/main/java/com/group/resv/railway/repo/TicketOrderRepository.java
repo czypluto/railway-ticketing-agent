@@ -15,9 +15,6 @@ public interface TicketOrderRepository extends JpaRepository<TicketOrder, Long> 
 
     List<TicketOrder> findByUserIdOrderByIdDesc(Long userId, org.springframework.data.domain.Pageable pageable);
 
-    boolean existsByUserIdAndTripIdAndSeatClassAndStatusIn(
-            Long userId, Long tripId, String seatClass, Collection<String> statuses);
-
     boolean existsByUserIdAndTripIdAndStatusIn(Long userId, Long tripId, Collection<String> statuses);
 
     List<TicketOrder> findByStatusAndCreatedAtBefore(String status, java.time.LocalDateTime before);

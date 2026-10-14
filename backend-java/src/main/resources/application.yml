@@ -36,9 +36,10 @@ app:
     qps: ${SECKILL_QPS:1000}
     burst: ${SECKILL_BURST:2000}
   stream:
-    order-key: resv:stream:orders
-    order-group: order-g
-    order-consumer: order-c1
+    # Stream key 由 RailwayKeys.orderStream() 统一维护（生产端与消费端共用同一常量），不放配置。
+    # 此前配置里写的是 order-g/order-c1，代码里硬编码 rv-order-g/rv-order-c1，两边对不上且配置从未被读取。
+    order-group: rv-order-g
+    order-consumer: rv-order-c1
 
 logging:
   level:

@@ -4,6 +4,7 @@ import com.group.resv.railway.domain.TicketOrder;
 import com.group.resv.railway.repo.TicketOrderRepository;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.boot.ApplicationArguments;
 import org.springframework.boot.ApplicationRunner;
 import org.springframework.core.annotation.Order;
@@ -32,12 +33,16 @@ public class TicketOrderConsumer implements ApplicationRunner {
     private final StringRedisTemplate redis;
     private final TicketOrderRepository orderRepository;
     private final String streamKey = RailwayKeys.orderStream();
-    private final String group = "rv-order-g";
-    private final String consumerName = "rv-order-c1";
+    private final String group;
+    private final String consumerName;
 
-    public TicketOrderConsumer(StringRedisTemplate redis, TicketOrderRepository orderRepository) {
+    public TicketOrderConsumer(StringRedisTemplate redis, TicketOrderRepository orderRepository,
+                               @Value("${app.stream.order-group:rv-order-g}") String group,
+                               @Value("${app.stream.order-consumer:rv-order-c1}") String consumerName) {
         this.redis = redis;
         this.orderRepository = orderRepository;
+        this.group = group;
+        this.consumerName = consumerName;
     }
 
     @Override
