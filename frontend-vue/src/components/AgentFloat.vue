@@ -172,7 +172,8 @@ function onViewportResize() {
 onMounted(() => {
   loadState()
   saveState()
-  resumeLast() // 续上最近一次对话
+  // 未登录时不要拉历史：会产生一条无谓的 401（历史接口要求带 token）
+  if (localStorage.getItem(props.tokenKey)) resumeLast()
   window.addEventListener('resize', onViewportResize)
 })
 onBeforeUnmount(() => {

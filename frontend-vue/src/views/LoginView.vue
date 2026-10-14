@@ -62,7 +62,7 @@ async function submit() {
         </el-button>
       </el-form>
       <div class="login-tip">
-        演示账号：zhanggong / 123456（高级工程师）；wangzong / 123456（高管）
+        演示账号：zhanggong / 123456（技术部 · 购票业务）；wangzong / 123456（管理员 · 另含知识库与铁路管理）
       </div>
     </div>
   </div>
