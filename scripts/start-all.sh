@@ -28,8 +28,8 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 
 info() { printf '[start-all] %s\n' "$*"; }
-is_up()  { curl -s -o /dev/null "$1"; }
-wsl_up() { wsl -e bash -lc "curl -s -o /dev/null http://127.0.0.1:$1$2" >/dev/null 2>&1; }
+is_up()  { curl -sf -o /dev/null "$1"; }   # -f：只有 2xx 才算通，404/403 不算
+wsl_up() { wsl -e bash -lc "curl -sf -o /dev/null http://127.0.0.1:$1$2" >/dev/null 2>&1; }
 wait_up() { # wait_up <秒> <命令...>
   local n=$1; shift
   for _ in $(seq 1 "$n"); do "$@" && return 0; sleep 2; done
@@ -204,12 +204,12 @@ fi
 
 # 2) Java(8080, Windows)
 ensure_java_home || exit 1
-if is_up http://127.0.0.1:8080/api/resources; then
+if is_up http://127.0.0.1:8080/v3/api-docs; then
   info "Java(8080) 已在运行，跳过"
 else
   info "启动 Java(8080)…（首次会编译，稍等）"
   run_bg "$ROOT/backend-java" "$ROOT/backend-java/target/boot.log" 'mvn -q -DskipTests spring-boot:run'
-  if wait_up 60 is_up http://127.0.0.1:8080/api/resources; then
+  if wait_up 60 is_up http://127.0.0.1:8080/v3/api-docs; then
     info "Java(8080) 就绪"
   else
     info "Java 启动失败，boot.log 末尾："
