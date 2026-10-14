@@ -1,4 +1,5 @@
-"""Agent 关键纯逻辑单测：工具契约、规则问题识别、结果格式化、模型路由。
+"""Agent 关键纯逻辑单测：工具契约、结果格式化、防臆造车次、模型路由。
+
 用法（venv 内）：python -m pytest tests -q
 """
 import sys
@@ -11,17 +12,13 @@ from app.agent import orchestrator  # noqa: E402
 from app.tools import all_schemas  # noqa: E402
 
 
-def test_tool_contract_has_expected_five():
+def test_tool_contract_has_core_business_tools():
     names = {t["function"]["name"] for t in all_schemas()}
-    assert names == {"query_tickets", "buy_ticket", "my_orders", "pay_ticket", "cancel_ticket"}
-
-
-def test_rule_hints_covers_policy_questions():
-    # 规则类问题必须命中，避免误走工具调用
-    for text in ["退票怎么收费", "儿童票有什么规定", "学生票优惠", "改签规则", "能带多少行李"]:
-        assert any(h in text for h in orchestrator.RULE_HINTS), text
-    # 购票类问题不命中
-    assert not any(h in "帮我查明天北京到上海的二等座" for h in orchestrator.RULE_HINTS)
+    core = {"query_tickets", "buy_ticket", "my_orders", "pay_ticket", "cancel_ticket"}
+    assert core <= names, names
+    # 业务全量 + 只读：订单详情/车站/列车/车次/联系人/资料均需注册
+    assert {"order_detail", "list_stations", "list_trains", "list_trips",
+            "list_contacts", "add_contact", "get_profile"} <= names, names
 
 
 def test_query_text_format_contains_key_fields():
@@ -39,7 +36,9 @@ def test_resolve_model_defaults_to_official_id():
 
 
 def test_buy_trip_must_come_from_query_results():
+    """防臆造车次：模型给出的 tripId 必须能在上一轮查票结果里找到，否则拒绝下单。"""
     rows = [{"tripId": 2, "trainCode": "G101"}]
-    assert orchestrator._is_known_trip(rows, 2) is True
-    assert orchestrator._is_known_trip(rows, 99) is False
-    assert orchestrator._is_known_trip(None, 2) is False
+    assert orchestrator._find_trip(rows, 2)["trainCode"] == "G101"
+    assert orchestrator._find_trip(rows, 99) is None
+    assert orchestrator._find_trip(None, 2) is None
+    assert orchestrator._find_trip([], 2) is None

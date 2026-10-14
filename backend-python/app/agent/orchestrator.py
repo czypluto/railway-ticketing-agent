@@ -1,7 +1,9 @@
 """Agent 调度中心（铁路购票）：自然语言 -> Java 接口参数。
 
-流程：意图识别 -> 参数补全 -> 查票 -> 展示并引导下单 -> 支付/退票。
-纯规则问题（退改签/儿童票/学生票…）走 RAG 知识库；其余走工具调用 Java。
+流程：每轮先做一次 RAG 检索，把【参考资料】注入上下文；再由模型以 function-calling
+循环决策——直接依据资料作答，或调用工具（查票/下单/支付/退票等）。
+
+改数据的动作不交给模型：buy_ticket 的 tripId 必须来自上一轮查票结果，下单走两阶段确认。
 """
 import logging
 import uuid
@@ -11,12 +13,11 @@ from typing import AsyncIterator, Optional
 from .. import config, java_client, llm, tools
 from ..llm import LlmError
 from ..middleware import current_user
-from ..rag.store import RagStore, rag_available
+from ..rag.store import RagStore, get_store, rag_available
+from . import history as hist
 from . import memory as mem
 
 logger = logging.getLogger(__name__)
-
-RULE_HINTS = ("退票", "改签", "儿童", "学生", "票价", "携带", "行李", "证件", "规则", "能不能", "什么规定", "手续费")
 
 # 动作词：命中则视为"办业务"而非"问规则"，避免规则词把下单请求吞进 RAG
 ACTION_WORDS = ("买", "订", "购", "预约", "帮我查", "下单")
@@ -28,36 +29,26 @@ def _event(kind: str, text: str, task: str = "agent") -> dict:
     return {"kind": kind, "text": text, "model": config.resolve_model(task)}
 
 
-def _is_known_trip(rows, trip_id) -> bool:
-    """tripId 是否来自最近的查票结果（防模型臆造车次）。"""
+def _find_trip(rows, trip_id):
+    """从上一轮查票结果里取出 tripId 对应的行；取不到返回 None。
+
+    这是"防模型臆造车次"的落点：模型给出的 tripId 必须能在查票结果里找到，
+    否则拒绝下单。历史上此逻辑在生产代码里是内联写的，这里抽出来以便单测覆盖。
+    """
     if not rows:
-        return False
-    return any(r.get("tripId") == trip_id for r in rows)
-
-
-def _history_messages(raw: list[dict]) -> list[dict]:
-    """把记忆里的轮次清洗成可用的对话历史（去重角色/去空/限长），供注入上下文。"""
-    out: list[dict] = []
-    prev = None
-    for m in raw:
-        role = m.get("role")
-        content = (m.get("content") or "").strip()
-        if role not in ("user", "assistant") or not content or role == prev:
-            continue
-        out.append({"role": role, "content": content})
-        prev = role
-    if out and out[0]["role"] != "user":
-        out = out[1:]
-    if out and out[-1]["role"] == "user":
-        out = out[:-1]  # 不落一条悬空 user（本轮会重发）
-    return out[-20:]
+        return None
+    return next((r for r in rows if r.get("tripId") == trip_id), None)
 
 
 def _system_prompt() -> str:
     return (
-        "你是铁路购票助手。今天是%s。查询用 query_tickets（站名+日期），下单用 buy_ticket（tripId 来自查询结果），"
-        "用户要查自己的订单用 my_orders。若必要参数缺失（如出发地/日期），直接向用户说明缺什么，不要编造参数。"
-        "涉及退改签/儿童/学生等规定的问题不调用工具，直接回答。金额单位是分。说话简洁公文化。" % date.today().isoformat()
+        "你是铁路购票助手。今天是%s。\n"
+        "处理顺序（务必遵守）：\n"
+        "1. 规则/规定/知识类问题（退改签/儿童/学生/票价/携带行李等）先依据【参考资料】回答，资料覆盖就不要再调工具；资料未覆盖则明说“未查到相关规定”。\n"
+        "2. 业务操作（查票/购票/我的订单/订单详情/支付/退票/常用联系人/个人资料/列车车次车站列表等）调用工具走 Java 完成；退票等操作若不确定是哪张，先调 my_orders 列出再让用户确认 requestId。\n"
+        "3. 参考资料与可用工具都无法满足用户请求时，明确回答“我暂时无法办理/不清楚，请补充信息或联系人工”，绝不编造结论、车次或参数。\n"
+        "必要参数缺失（如出发地/日期）时直接问用户缺什么。金额单位是分。说话简洁公文化。"
+        % date.today().isoformat()
     )
 
 
@@ -73,7 +64,7 @@ class AgentService:
 
     def _rag_store(self) -> Optional[RagStore]:
         if self._rag is None:
-            self._rag = RagStore() if rag_available() else None
+            self._rag = get_store() if rag_available() else None
         return self._rag
 
     async def handle(self, user_text: str) -> AsyncIterator[dict]:
@@ -108,20 +99,29 @@ class AgentService:
             # 用户改了主意/新请求：作废旧意向，落到下面按新请求处理
             self._intents.pop(user.user_id, None)
 
-        # 规则类问题直接走知识库（若含动作词则视为办业务，交给工具循环）
-        if any(h in user_text for h in RULE_HINTS) and not any(a in user_text for a in ACTION_WORDS):
-            async for ev in self._rule_answer(user_text):
-                yield ev
-            return
+        # 记忆按会话隔离：上下文取自“当前会话”，切会话即切上下文
+        session = hist.current_session(user.user_id)
+        state = mem.load_state(user.user_id, session=session)
 
-        state = mem.load_state(user.user_id)
+        # 每轮先做一次 RAG 检索：把相关规则/知识作为参考资料注入，模型先看资料再决定要不要调 Java 工具
+        refs: list[str] = []
+        rag = self._rag_store()
+        if rag and rag.enabled:
+            try:
+                refs = await rag.retrieve(user_text, department=user.department, top_k=4)
+            except Exception as e:  # noqa: BLE001
+                logger.warning("RAG 检索失败，跳过参考注入：%s", e)
+        ref_block = "【参考资料】\n" + "\n---\n".join(r.strip() for r in refs if r and r.strip()) \
+            if refs else "【参考资料】（未检索到相关资料）"
+
         sys_content = _system_prompt()
         if state["summary"]:
             # 早期上下文已压缩成摘要，注入 system，避免无限增长
             sys_content += f"\n\n【此前对话摘要】{state['summary']}"
         msgs = [{"role": "system", "content": sys_content}]
         msgs.extend(state["msgs"])  # 近期原文（最近几轮，保证指代细节）
-        msgs.append({"role": "user", "content": f"已知车站：{station_line}\n\n用户请求：{user_text}"})
+        msgs.append({"role": "user",
+                     "content": f"已知车站：{station_line}\n\n{ref_block}\n\n用户请求：{user_text}"})
 
         rounds = 0
         shown = False
@@ -134,18 +134,16 @@ class AgentService:
                 return
 
             if not out.tool_calls:
-                if shown:
-                    # 结果已由前面的 [result] 事件给出，这里不补无信息收尾；
-                    # 若模型确有补充话术则照实给
-                    if out.content and out.content.strip():
-                        yield _event("answer", out.content)
+                # 模型未调工具：把它基于参考资料给出的答复照实给用户；
+                # 空回复则区分“疑似办业务”与“问不到答不出”，给补充引导或诚实说明无法办理
+                if out.content and out.content.strip():
+                    yield _event("answer", out.content)
+                elif shown:
+                    pass  # 结果事件已给出，无需再补空话
                 elif any(a in user_text for a in ACTION_WORDS):
-                    # 办业务但模型没调工具（多半缺信息）：把模型的话还给用户，不再发占位/RAG
-                    text = out.content or "请补充需要办理的内容，例如出发地/到达地/日期/席别，或要操作的订单。"
-                    yield _event("answer", text)
+                    yield _event("answer", "请补充需要办理的内容（如出发地/到达地/日期/席别），或说明要操作哪张订单。")
                 else:
-                    async for ev in self._rule_answer(user_text):
-                        yield ev
+                    yield _event("answer", "抱歉，我暂时无法办理或未查到相关资料。请补充说明，或联系人工处理。")
                 return
 
             acted = False
@@ -165,8 +163,7 @@ class AgentService:
                         yield _event("result", text)
                     elif name == "buy_ticket":
                         # 防臆造 + 反向复述：tripId 必须来自查票结果，且下单前请用户确认
-                        row = next((r for r in self._rows.get(user.user_id, [])
-                                    if r.get("tripId") == args.get("tripId")), None)
+                        row = _find_trip(self._rows.get(user.user_id, []), args.get("tripId"))
                         if row is None:
                             yield _event("error", "请先使用 query_tickets 查询车次，再从结果中选择要购买的车次。")
                             return
@@ -201,6 +198,43 @@ class AgentService:
                         text = self._orders_text(rows)
                         msgs.append({"role": "assistant", "content": f"我的订单：\n{text}"})
                         yield _event("result", text)
+                    elif name == "order_detail":
+                        d = await java_client.order_detail(args["requestId"])
+                        shown = True
+                        acted = True
+                        text = self._kv_text(d)
+                        msgs.append({"role": "assistant", "content": f"订单详情：\n{text}"})
+                        yield _event("result", text)
+                    elif name in ("list_stations", "list_trains", "list_trips", "list_contacts"):
+                        if name == "list_stations":
+                            rows = await java_client.stations(args.get("kw") or "")
+                        elif name == "list_trains":
+                            rows = await java_client.list_trains()
+                        elif name == "list_trips":
+                            rows = await java_client.list_trips(args.get("date"), args.get("trainId"))
+                        else:
+                            rows = await java_client.list_contacts()
+                        shown = True
+                        acted = True
+                        text = self._kv_text(rows)
+                        msgs.append({"role": "assistant", "content": f"{name}：\n{text}"})
+                        yield _event("result", text)
+                    elif name == "add_contact":
+                        c = await java_client.add_contact(
+                            args["name"], args.get("idType"), args.get("idNo"),
+                            args.get("phone"), args.get("age"))
+                        shown = True
+                        acted = True
+                        line = f"已新增联系人：{c.get('name')}（id={c.get('id')}）"
+                        msgs.append({"role": "assistant", "content": line})
+                        yield _event("result", line)
+                    elif name == "get_profile":
+                        p = await java_client.get_profile()
+                        shown = True
+                        acted = True
+                        text = self._kv_text(p)
+                        msgs.append({"role": "assistant", "content": f"个人资料：\n{text}"})
+                        yield _event("result", text)
                     elif name == "pay_ticket":
                         rid = args["requestId"]
                         r = await java_client.pay(rid)
@@ -227,9 +261,9 @@ class AgentService:
             # 是否还需要继续（如查完票再下单）：再问一次模型，让它决定收尾还是下单
             msgs.append({"role": "user",
                          "content": "基于以上结果：如果还需继续就调用下一个工具；已完事则仅用一句话回复用户。"})
-        # 循环结束兜底：结果已由各 [result] 给出；只有完全没出结果才提示补充
+        # 循环结束兜底：结果已由各 [result] 给出；完全没出结果则诚实说明，不编造
         if not shown:
-            yield _event("answer", "暂时没能自动办理，请补充需要办理的内容（车次/日期/席别或订单号）。")
+            yield _event("answer", "抱歉，暂时没有可用工具或资料能办理这件事。请换一种说法，或补充车次/日期/席别/订单号。")
 
     async def _commit_buy(self, user, intent) -> AsyncIterator[dict]:
         """用户确认后执行预填下单（确定性路径，不再让模型介入）。"""
@@ -260,31 +294,6 @@ class AgentService:
                 pass
         return ""
 
-    async def _rule_answer(self, user_text: str) -> AsyncIterator[dict]:
-        rag = self._rag_store()
-        context = await rag.retrieve(user_text, department=current_user().department) if rag and rag.enabled else []
-        try:
-            if context:
-                answer = await llm.chat(
-                    task="gen",
-                    messages=[
-                        {"role": "system", "content": "严格依据资料回答：有明确数字/条件就直说，没有的明说未查到。"},
-                        {"role": "user", "content": f"资料：\n{chr(10).join(context)}\n\n问题：{user_text}"},
-                    ],
-                )
-            else:
-                answer = await llm.chat(
-                    task="gen",
-                    messages=[
-                        {"role": "system", "content": "你是铁路售票助手，不知道的别编，引导用户查看官网或客服。"},
-                        {"role": "user", "content": user_text},
-                    ],
-                )
-        except LlmError as e:
-            yield _event("error", str(e), "gen")
-            return
-        yield _event("answer", answer.content, "gen")
-
     @staticmethod
     def _query_text(rows: list[dict]) -> str:
         if not rows:
@@ -304,3 +313,16 @@ class AgentService:
             f"- {o.get('orderNo')} {o.get('from')}->{o.get('to')} {o.get('seatClass')} "
             f"{o.get('priceCents')}分 {o.get('status')} requestId={o.get('requestId')}"
             for o in rows)
+
+    @staticmethod
+    def _kv_text(obj) -> str:
+        """把单个对象或对象数组渲染成可读文本（供订单详情/车站/列车/车次/联系人/资料等通用展示）。"""
+        def line(r: dict) -> str:
+            return ", ".join(f"{k}={v}" for k, v in r.items() if v is not None)
+        if isinstance(obj, list):
+            if not obj:
+                return "暂无数据。"
+            return "\n".join(f"- {line(r)}" for r in obj)
+        if not obj:
+            return "暂无数据。"
+        return line(obj)

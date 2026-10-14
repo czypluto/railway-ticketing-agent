@@ -33,6 +33,7 @@ class JavaError(Exception):
     def __init__(self, code: int, msg: str):
         super().__init__(msg)
         self.code = code
+        self.msg = msg  # 供编排层 e.msg 取业务提示；str(e) 同样返回该消息
 
 
 async def _call(method: str, path: str, body: Optional[dict] = None) -> Any:
@@ -81,12 +82,52 @@ async def my_orders() -> list[dict]:
     return await _call("GET", "/api/ticket/orders/my") or []
 
 
+async def order_detail(request_id: str) -> dict:
+    return await _call("GET", f"/api/ticket/orders/request/{request_id}")
+
+
 async def pay(request_id: str) -> dict:
     return await _call("POST", f"/api/ticket/orders/{request_id}/pay")
 
 
 async def cancel(request_id: str) -> dict:
     return await _call("POST", f"/api/ticket/orders/{request_id}/cancel")
+
+
+async def list_trains() -> list[dict]:
+    return await _call("GET", "/api/rail/trains") or []
+
+
+async def list_trips(date: Optional[str] = None, train_id: Optional[int] = None) -> list[dict]:
+    params = {}
+    if date:
+        params["date"] = date
+    if train_id:
+        params["trainId"] = train_id
+    qs = "" if not params else "?" + urlencode(params)
+    return await _call("GET", f"/api/rail/trips{qs}") or []
+
+
+async def list_contacts() -> list[dict]:
+    return await _call("GET", "/api/user/contacts") or []
+
+
+async def add_contact(name: str, id_type: Optional[str] = None, id_no: Optional[str] = None,
+                      phone: Optional[str] = None, age: Optional[int] = None) -> dict:
+    body = {"name": name}
+    if id_type:
+        body["idType"] = id_type
+    if id_no:
+        body["idNo"] = id_no
+    if phone:
+        body["phone"] = phone
+    if age is not None:
+        body["age"] = age
+    return await _call("POST", "/api/user/contacts", body)
+
+
+async def get_profile() -> dict:
+    return await _call("GET", "/api/user/profile")
 
 
 async def _resolve_station(name: str) -> int:
