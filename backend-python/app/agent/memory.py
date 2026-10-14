@@ -36,15 +36,16 @@ except Exception:  # noqa: BLE001
     _redis = None
 
 
-def _key(user_id):
-    return f"{KEY_PREFIX}{user_id}"
+def _key(user_id, session=""):
+    # 记忆按会话隔离：mem:agent:{user}:{session}；缺省会话归入 default，兼容旧数据/单测
+    return f"{KEY_PREFIX}{user_id}:{session or 'default'}"
 
 
-def _read(user_id) -> dict:
+def _read(user_id, session="") -> dict:
     empty = {"summary": "", "msgs": []}
     c = _client() if _redis else None
     if c:
-        raw = c.get(_key(user_id))
+        raw = c.get(_key(user_id, session))
         if raw:
             try:
                 d = json.loads(raw)
@@ -52,20 +53,20 @@ def _read(user_id) -> dict:
             except Exception:  # noqa: BLE001
                 return empty
         return empty
-    return _fallback.get(user_id, dict(empty))
+    return _fallback.get((user_id, session or "default"), dict(empty))
 
 
-def _write(user_id, state):
+def _write(user_id, session, state):
     c = _client() if _redis else None
     if c:
-        c.setex(_key(user_id), TTL_SEC, json.dumps(state, ensure_ascii=False))
+        c.setex(_key(user_id, session), TTL_SEC, json.dumps(state, ensure_ascii=False))
     else:
-        _fallback[user_id] = state
+        _fallback[(user_id, session or "default")] = state
 
 
-def load_state(user_id) -> dict:
-    """返回 {summary, msgs}：msgs 为清洗后可直接注入的对话原文。"""
-    st = _read(user_id)
+def load_state(user_id, session="") -> dict:
+    """返回 {summary, msgs}：msgs 为清洗后可直接注入的对话原文（按会话隔离）。"""
+    st = _read(user_id, session)
     msgs = _clean(st.get("msgs", []))
     return {"summary": st.get("summary", ""), "msgs": msgs}
 
@@ -113,11 +114,11 @@ def _compress(summary_old: str, evicted: list[dict]) -> str:
     return merged[:_SUMMARY_MAX]
 
 
-def append(user_id, user_text, reply):
-    """记一轮 (user, assistant)；超窗则触发上下文压缩并保留近期原文。"""
+def append(user_id, user_text, reply, session=""):
+    """记一轮 (user, assistant) 到指定会话；超窗触发上下文压缩并保留近期原文。"""
     if not user_text or not reply:
         return
-    st = _read(user_id)
+    st = _read(user_id, session)
     msgs = st.get("msgs", [])
     if msgs and msgs[-1].get("role") == "user":
         msgs.pop()
@@ -130,11 +131,11 @@ def append(user_id, user_text, reply):
         summary = _compress(summary, evicted)
         msgs = keep
 
-    _write(user_id, {"summary": summary, "msgs": msgs})
+    _write(user_id, session, {"summary": summary, "msgs": msgs})
 
 
-def clear(user_id):
+def clear(user_id, session=""):
     c = _client() if _redis else None
     if c:
-        c.delete(_key(user_id))
-    _fallback.pop(user_id, None)
+        c.delete(_key(user_id, session))
+    _fallback.pop((user_id, session or "default"), None)

@@ -48,9 +48,9 @@ async def _stream(body: ChatBody):
             try:
                 # 1) 全量对话档案（可回溯）
                 hist.append_turn(uid, body.message, "\n".join(x for x in lines if x))
-                # 2) 当前对话记忆（压缩后的近期+摘要，供指代）
+                # 2) 当前对话记忆（按会话分片，供切回该会话时续聊）
                 if last:
-                    mem.append(uid, body.message, last)
+                    mem.append(uid, body.message, last, session=hist.current_session(uid))
             except Exception:  # noqa: BLE001
                 logger.warning("对话记录/记忆写入失败")
         yield "data: [DONE]\n\n"

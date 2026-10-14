@@ -22,9 +22,18 @@ def detail(session: str):
 
 @router.post("/reset")
 def reset():
-    """开新对话：新会话 + 清当前对话记忆。"""
+    """开新对话：另起会话。记忆按会话隔离，切回旧会话仍保留其上下文。"""
     s = hist.new_session(current_user().user_id)
     return {"code": 0, "msg": "ok", "data": {"session": s}}
+
+
+@router.post("/activate/{session}")
+def activate(session: str):
+    """切换到指定历史会话：之后的续聊（档案+记忆）都落在该会话。"""
+    ok = hist.activate(current_user().user_id, session)
+    if not ok:
+        return {"code": 404, "msg": "会话不存在或无权访问", "data": None}
+    return {"code": 0, "msg": "ok", "data": {"session": session}}
 
 
 @router.delete("/{session}")

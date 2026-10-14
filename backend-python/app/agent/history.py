@@ -61,8 +61,16 @@ def new_session(user_id) -> str:
         json.dumps({"startedAt": time.time(), "messages": []}, ensure_ascii=False),
         encoding="utf-8")
     _write_current(user_id, s)
-    mem.clear(user_id)  # 新对话也清空当前对话记忆
+    # 记忆已按会话隔离：新会话自带空桶，这里不再清整用户记忆（旧会话切回仍可继续）
     return s
+
+
+def activate(user_id, session) -> bool:
+    """把某历史会话设为“当前”，之后续聊（档案+记忆）都落回该会话。"""
+    if not (ROOT / f"{user_id}_{session}.json").exists():
+        return False
+    _write_current(user_id, session)
+    return True
 
 
 def append_turn(user_id, user_text: str, assistant_text: str):
@@ -104,10 +112,11 @@ def list_sessions(user_id) -> list[dict]:
 
 
 def delete_session(user_id, session):
-    """删除单个历史会话文件；若删除的是当前会话，同时清当前指向。"""
+    """删除单个历史会话文件与对应会话记忆；若删的是当前会话，同时清当前指向。"""
     p = _path(user_id, session)
     if p.exists():
         p.unlink()
+    mem.clear(user_id, session)  # 会话级记忆一并清掉，避免孤儿桶
     if _read_current(user_id) == session:
         d = {}
         try:
