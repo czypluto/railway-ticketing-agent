@@ -168,6 +168,13 @@ public class RailwayAdminController {
         return ApiResult.ok(trainStopRepository.findByTrainIdOrderBySeqAsc(id));
     }
 
+    /** 读取某列车的经停序列（此前只有"整体重建"接口，没有读取接口）。 */
+    @GetMapping("/trains/{id}/stops")
+    public ApiResult<List<Map<String, Object>>> trainStops(@PathVariable Long id) {
+        trainRepository.findById(id).orElseThrow(() -> new BizException(404, "车次不存在"));
+        return ApiResult.ok(stopViews(id));
+    }
+
     // ---------- 运行日 + 席别 ----------
     public record ClassBody(String seatClass, long priceCents, int totalSeats) {
     }
@@ -246,16 +253,7 @@ public class RailwayAdminController {
                 .map(c -> Map.<String, Object>of("seatClass", c.getSeatClass(),
                         "priceCents", c.getPriceCents(), "totalSeats", c.getTotalSeats()))
                 .toList();
-        List<Map<String, Object>> stops = trainStopRepository.findByTrainIdOrderBySeqAsc(trip.getTrainId()).stream()
-                .map(st -> {
-                    Station s = stationRepository.findById(st.getStationId()).orElse(null);
-                    return Map.<String, Object>of(
-                            "seq", st.getSeq(),
-                            "station", s == null ? String.valueOf(st.getStationId()) : s.getName(),
-                            "stationId", st.getStationId(),
-                            "arrive", st.getArriveTime() == null ? null : st.getArriveTime().toString(),
-                            "depart", st.getDepartTime() == null ? null : st.getDepartTime().toString());
-                }).toList();
+        List<Map<String, Object>> stops = stopViews(trip.getTrainId());
         Map<String, Object> m = new java.util.HashMap<>();
         m.put("tripId", trip.getId());
         m.put("travelDate", trip.getTravelDate());
@@ -263,6 +261,21 @@ public class RailwayAdminController {
         m.put("classes", classes);
         m.put("stops", stops);
         return m;
+    }
+
+    /** 经停序列视图。用 HashMap 而非 Map.of——首站的到达时间本来就可以为 null，Map.of 遇到 null 会抛 NPE。 */
+    private List<Map<String, Object>> stopViews(Long trainId) {
+        return trainStopRepository.findByTrainIdOrderBySeqAsc(trainId).stream()
+                .map(st -> {
+                    Station s = stationRepository.findById(st.getStationId()).orElse(null);
+                    Map<String, Object> m = new java.util.HashMap<>();
+                    m.put("seq", st.getSeq());
+                    m.put("stationId", st.getStationId());
+                    m.put("station", s == null ? String.valueOf(st.getStationId()) : s.getName());
+                    m.put("arrive", st.getArriveTime() == null ? null : st.getArriveTime().toString());
+                    m.put("depart", st.getDepartTime() == null ? null : st.getDepartTime().toString());
+                    return m;
+                }).toList();
     }
 
     private LocalTime parse(String s) {
