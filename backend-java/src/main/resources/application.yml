@@ -4,6 +4,10 @@ server:
 spring:
   application:
     name: resv-backend
+  autoconfigure:
+    # 认证完全走自定义 JWT 过滤器链，不需要 Spring 自动配置的那个内存用户。
+    # 不排除的话，每次启动都会生成一个随机密码的默认 user 并打印安全告警，容易误导。
+    exclude: org.springframework.boot.autoconfigure.security.servlet.UserDetailsServiceAutoConfiguration
   datasource:
     url: jdbc:mysql://${MYSQL_HOST:127.0.0.1}:${MYSQL_PORT:3306}/${MYSQL_DB:resv}?useUnicode=true&characterEncoding=utf8&serverTimezone=Asia/Shanghai&useSSL=false&allowPublicKeyRetrieval=true
     username: ${MYSQL_USER:resv}
