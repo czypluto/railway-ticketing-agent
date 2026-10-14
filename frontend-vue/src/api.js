@@ -201,3 +201,74 @@ export async function kbReingest() {
 export async function kbAudit(limit = 100) {
   return jfetch(`/py-api/api/admin/kb/audit?limit=${limit}`)
 }
+
+// ---------- 铁路管理（仅 ADMIN） ----------
+
+/** 高危操作一次性确认码：删除类接口要求先取码，再以 X-Confirm-Token 头携带。 */
+async function railConfirm(op, target) {
+  return jfetch('/java-api/api/rail/confirm/request', {
+    method: 'POST',
+    body: JSON.stringify({ op, target })
+  })
+}
+
+export async function railStations(kw = '') {
+  return jfetch(`/java-api/api/rail/stations${kw ? `?kw=${encodeURIComponent(kw)}` : ''}`)
+}
+
+export async function railAddStation(code, name) {
+  return jfetch('/java-api/api/rail/stations', { method: 'POST', body: JSON.stringify({ code, name }) })
+}
+
+export async function railTrains() {
+  return jfetch('/java-api/api/rail/trains')
+}
+
+export async function railAddTrain(code, name, kind) {
+  return jfetch('/java-api/api/rail/trains', { method: 'POST', body: JSON.stringify({ code, name, kind }) })
+}
+
+export async function railUpdateTrain(id, name, kind) {
+  return jfetch(`/java-api/api/rail/trains/${id}`, { method: 'PUT', body: JSON.stringify({ name, kind }) })
+}
+
+export async function railDeleteTrain(id) {
+  const c = await railConfirm('deleteTrain', id)
+  return jfetch(`/java-api/api/rail/trains/${id}`, { method: 'DELETE', headers: { 'X-Confirm-Token': c.token } })
+}
+
+export async function railTrainStops(trainId) {
+  return jfetch(`/java-api/api/rail/trains/${trainId}/stops`)
+}
+
+/** 整体重建经停序列（按数组顺序赋 seq，至少两个站）。 */
+export async function railSaveStops(trainId, stops) {
+  return jfetch(`/java-api/api/rail/trains/${trainId}/stops`, {
+    method: 'POST',
+    body: JSON.stringify({ stops })
+  })
+}
+
+export async function railTrips({ date = '', trainId = '' } = {}) {
+  const p = new URLSearchParams()
+  if (date) p.set('date', date)
+  if (trainId) p.set('trainId', trainId)
+  const q = p.toString()
+  return jfetch(`/java-api/api/rail/trips${q ? `?${q}` : ''}`)
+}
+
+export async function railTripDetail(id) {
+  return jfetch(`/java-api/api/rail/trips/${id}`)
+}
+
+export async function railCreateTrip(trainId, travelDate, classes) {
+  return jfetch('/java-api/api/rail/trips', {
+    method: 'POST',
+    body: JSON.stringify({ trainId, travelDate, classes })
+  })
+}
+
+export async function railDeleteTrip(id) {
+  const c = await railConfirm('deleteTrip', id)
+  return jfetch(`/java-api/api/rail/trips/${id}`, { method: 'DELETE', headers: { 'X-Confirm-Token': c.token } })
+}
