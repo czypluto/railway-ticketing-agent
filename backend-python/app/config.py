@@ -54,6 +54,7 @@ EMBED_MAX_LEN = int(os.getenv("EMBEDDING_MAX_LEN", "2048"))
 
 RAG_DB = ROOT / "data" / "rag.db"
 DOCS_DIR = ROOT / "data" / "docs"
+AUDIT_FILE = ROOT / "data" / "audit" / "kb.jsonl"  # 知识库管理操作审计（含被拒的越权尝试）
 
 
 def resolve_model(task: str) -> str:

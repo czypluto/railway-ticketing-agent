@@ -3,7 +3,7 @@
 // 上传同名文件即“替换”（后端先删同名旧向量再入库，不会重复堆积）。
 import { onMounted, ref } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
-import { kbDelete, kbList, kbReingest, kbUpload } from '../api'
+import { kbAudit, kbDelete, kbList, kbReingest, kbUpload } from '../api'
 
 const files = ref([])
 const loading = ref(false)
@@ -12,9 +12,21 @@ const reingesting = ref(false)
 const fileInput = ref(null)
 const deleting = ref('')
 
+const audits = ref([])
+const auditLoading = ref(false)
+
 const KB_HINT =
   '支持 .md / .docx / .pdf（单文件 ≤ 20MB）。上传同名文件即为替换。' +
   'Markdown 可在正文最前用 "dept_tags: 技术部"（或顶部 ---front matter--- 块）声明部门可见性，未声明默认全员可见。'
+
+// 审计动作 => 中文标签
+const ACTION_LABEL = {
+  'kb.upload': '上传',
+  'kb.delete': '删除',
+  'kb.reingest': '全部重建',
+  'kb.list': '查看列表',
+  'kb.audit': '查看审计'
+}
 
 function fmtSize(b) {
   if (!b && b !== 0) return '-'
@@ -32,6 +44,23 @@ async function load() {
   } finally {
     loading.value = false
   }
+}
+
+async function loadAudit() {
+  auditLoading.value = true
+  try {
+    audits.value = await kbAudit(100)
+  } catch (e) {
+    ElMessage.error(e.message)
+  } finally {
+    auditLoading.value = false
+  }
+}
+
+/** 写操作后列表与审计一起刷新 */
+async function refresh() {
+  await load()
+  await loadAudit()
 }
 
 function pick() {
@@ -57,7 +86,7 @@ function onPick(e) {
     try {
       const d = await kbUpload(f.name, b64)
       ElMessage.success(`已入库「${d.name}」，新增 ${d.added} 段（同名文件已替换）`)
-      await load()
+      await refresh()
     } catch (err) {
       ElMessage.error(err.message)
     } finally {
@@ -106,7 +135,7 @@ async function reingestAll() {
   }
 }
 
-onMounted(load)
+onMounted(refresh)
 </script>
 
 <template>
@@ -142,6 +171,33 @@ onMounted(load)
       </el-table-column>
       <template #empty>
         <div class="kb-empty">data/docs 下暂无文档，点“上传文件”添加第一条知识。</div>
+      </template>
+    </el-table>
+
+    <div class="kb-bar kb-bar-audit">
+      <span class="kb-title">操作审计</span>
+      <el-button size="small" :loading="auditLoading" @click="loadAudit">刷新</el-button>
+    </div>
+    <div class="kb-hint">
+      记录知识库的每次上传/删除/重建，以及被拒绝的越权尝试（含操作人、角色、部门、目标与结果）。
+    </div>
+    <el-table :data="audits" v-loading="auditLoading" size="small" border class="kb-table">
+      <el-table-column prop="ts" label="时间" width="180" />
+      <el-table-column label="操作人" width="160">
+        <template #default="{ row }">{{ row.name || row.username }}（{{ row.role }}）</template>
+      </el-table-column>
+      <el-table-column label="动作" width="100" align="center">
+        <template #default="{ row }">{{ ACTION_LABEL[row.action] || row.action }}</template>
+      </el-table-column>
+      <el-table-column prop="target" label="目标" min-width="200" show-overflow-tooltip />
+      <el-table-column label="结果" width="90" align="center">
+        <template #default="{ row }">
+          <el-tag :type="row.ok ? 'success' : 'danger'" size="small">{{ row.ok ? '成功' : '已拒绝' }}</el-tag>
+        </template>
+      </el-table-column>
+      <el-table-column prop="detail" label="详情" min-width="220" show-overflow-tooltip />
+      <template #empty>
+        <div class="kb-empty">暂无操作记录。</div>
       </template>
     </el-table>
   </div>
@@ -180,5 +236,8 @@ onMounted(load)
 .kb-empty {
   color: #9aa7b5;
   padding: 20px 0;
+}
+.kb-bar-audit {
+  margin-top: 22px;
 }
 </style>

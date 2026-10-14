@@ -33,6 +33,7 @@ Thumbs.db
 milvus_data/
 mysql_data/
 backend-python/data/rag.db
+backend-python/data/audit/
 backend-python/wsl-uvicorn.log
 
 backend-python/data/chat_hist/

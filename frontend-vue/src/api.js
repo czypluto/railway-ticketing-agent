@@ -173,3 +173,8 @@ export async function kbDelete(file) {
 export async function kbReingest() {
   return jfetch('/py-api/api/admin/kb/reingest', { method: 'POST' })
 }
+
+/** 知识库操作审计（写操作 + 被拒的越权尝试），最新在前 */
+export async function kbAudit(limit = 100) {
+  return jfetch(`/py-api/api/admin/kb/audit?limit=${limit}`)
+}
