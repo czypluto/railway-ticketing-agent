@@ -1,7 +1,6 @@
 package com.group.resv.railway;
 
 import com.group.resv.railway.domain.TicketOrder;
-import com.group.resv.railway.repo.TicketOrderRepository;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.data.redis.core.StringRedisTemplate;
@@ -9,40 +8,47 @@ import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Component;
 
 import java.time.LocalDateTime;
-import java.util.List;
 
 /**
  * 超时订单治理：把超过 10 分钟仍待支付的订单置为 EXPIRED 并回补余票。
+ *
+ * 状态变更与并发互斥放在 {@link TicketExpireService}（有自己的事务边界）；
+ * 本类只负责调度与"确认过期后"的副作用（回补余票、释放一人一票占位）。
  */
 @Component
 public class TicketExpireJob {
 
     private static final Logger log = LoggerFactory.getLogger(TicketExpireJob.class);
 
-    private final TicketOrderRepository orderRepository;
+    /** 待支付时限：从**下单时刻**起算（事件里带的下单时间戳），不是从落库时刻起算。 */
+    private static final int PAY_WINDOW_MINUTES = 10;
+
+    private final TicketExpireService expireService;
     private final RailwayStockService stockService;
     private final StringRedisTemplate redis;
 
-    public TicketExpireJob(TicketOrderRepository orderRepository, RailwayStockService stockService,
+    public TicketExpireJob(TicketExpireService expireService, RailwayStockService stockService,
                            StringRedisTemplate redis) {
-        this.orderRepository = orderRepository;
+        this.expireService = expireService;
         this.stockService = stockService;
         this.redis = redis;
     }
 
     @Scheduled(fixedDelay = 60_000)
     public void expirePending() {
-        List<TicketOrder> stale = orderRepository.findByStatusAndCreatedAtBefore(
-                TicketOrder.PENDING, LocalDateTime.now().minusMinutes(10));
-        for (TicketOrder o : stale) {
+        for (Long orderId : expireService.findStaleIds(
+                LocalDateTime.now().minusMinutes(PAY_WINDOW_MINUTES))) {
             try {
-                o.setStatus(TicketOrder.EXPIRED);
-                orderRepository.save(o); // 若与支付并发，乐观锁会让其中一方失败并重试下一轮
-                stockService.release(o.getTripId(), o.getSeatClass());
-                redis.delete(RailwayKeys.active(o.getUserId(), o.getTripId()));
-                log.info("订单 {} 超时未支付，已过期并回补余票、释放占位", o.getRequestId());
-            } catch (Exception e) {  // noqa: BLE001
-                log.warn("订单 {} 过期处理失败（可能正被支付），跳过本轮：{}", o.getRequestId(), e.getMessage());
+                // 只有本次确实改成 EXPIRED 才回补；被支付/退票抢先则返回 null，不能回补
+                TicketOrder expired = expireService.tryExpire(orderId);
+                if (expired == null) {
+                    continue;
+                }
+                stockService.release(expired.getTripId(), expired.getSeatClass());
+                redis.delete(RailwayKeys.active(expired.getUserId(), expired.getTripId()));
+                log.info("订单 {} 超时未支付，已过期并回补余票、释放占位", expired.getRequestId());
+            } catch (Exception e) {
+                log.warn("订单 {} 过期处理失败（可能正被支付），跳过本轮：{}", orderId, e.getMessage());
             }
         }
     }
