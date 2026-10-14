@@ -100,7 +100,8 @@ export function chatStream(message, token, onEvent, onDone) {
 // ---------- 铁路购票（Java） ----------
 
 export async function listStations(kw = '') {
-  return jfetch(`/java-api/api/rail/stations${kw ? `?kw=${encodeURIComponent(kw)}` : ''}`)
+  // 走业务侧只读接口；/api/rail/stations 是 ADMIN-only，普通用户会 403
+  return jfetch(`/java-api/api/ticket/stations${kw ? `?kw=${encodeURIComponent(kw)}` : ''}`)
 }
 
 export async function queryTickets(from, to, date, seatClass = '') {
@@ -109,10 +110,10 @@ export async function queryTickets(from, to, date, seatClass = '') {
   return jfetch(`/java-api/api/ticket/query?${p.toString()}`)
 }
 
-export async function buyTicket({ tripId, seatClass, fromStationId, toStationId, contactId = null }) {
+export async function buyTicket({ tripId, seatClass, fromStationId, toStationId, contactId = null, ticketType = 'ADULT' }) {
   return jfetch('/java-api/api/ticket/buy', {
     method: 'POST',
-    body: JSON.stringify({ tripId, seatClass, fromStationId, toStationId, contactId })
+    body: JSON.stringify({ tripId, seatClass, fromStationId, toStationId, contactId, ticketType })
   })
 }
 

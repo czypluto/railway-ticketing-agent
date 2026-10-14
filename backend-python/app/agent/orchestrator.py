@@ -175,6 +175,7 @@ class AgentService:
                             "date": row.get("travelDate"),
                             "trainCode": row.get("trainCode"),
                             "ticketType": (args.get("ticketType") or "ADULT").upper(),
+                            "contactId": args.get("contactId"),
                         }
                         self._intents[user.user_id] = intent
                         shown = True
@@ -270,7 +271,8 @@ class AgentService:
         try:
             r = await java_client.buy_ticket(
                 int(intent["tripId"]), intent["seatClass"], intent["from"], intent["to"],
-                ticket_type=intent.get("ticketType", "ADULT"))
+                ticket_type=intent.get("ticketType", "ADULT"),
+                contact_id=intent.get("contactId"))
         except java_client.JavaError as e:
             yield _event("error", e.msg)
             return

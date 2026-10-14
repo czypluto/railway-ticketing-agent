@@ -44,25 +44,45 @@ async function search() {
   }
 }
 
-async function buy(row) {
+// 购票弹窗：可选乘车人（常用联系人 / 本人）与票种（成人 / 儿童 / 学生）。
+// 儿童票、学生票的资格与价格由 Java 侧 TicketPolicy 确定性裁决，前端只负责传票种，不做判断。
+const buyVisible = ref(false)
+const buying = ref(false)
+const buyRow = ref(null)
+const buyForm = reactive({ contactId: null, ticketType: 'ADULT' })
+const TICKET_TYPES = [
+  { value: 'ADULT', label: '成人票' },
+  { value: 'CHILD', label: '儿童票（6-14 周岁半价）' },
+  { value: 'STUDENT', label: '学生票（学生 + 二等座 + 寒暑假）' }
+]
+
+function openBuy(row) {
+  buyRow.value = row
+  buyForm.contactId = null
+  buyForm.ticketType = 'ADULT'
+  buyVisible.value = true
+}
+
+async function confirmBuy() {
+  if (!buyRow.value) return
+  buying.value = true
   try {
-    const { value } = await ElMessageBox.prompt(
-      `确认购买 ${row.trainCode} ${row.from}->${row.to} ${row.seatClass}（¥${yuan(row.priceCents)}）？\n乘车人默认本人。`,
-      '确认购票',
-      { confirmButtonText: '确认购买', cancelButtonText: '取消', inputPlaceholder: '输入订单备注（可选）' }
-    )
     const r = await buyTicket({
-      tripId: row.tripId,
-      seatClass: row.seatClass,
+      tripId: buyRow.value.tripId,
+      seatClass: buyRow.value.seatClass,
       fromStationId: form.from,
-      toStationId: form.to
+      toStationId: form.to,
+      contactId: buyForm.contactId,
+      ticketType: buyForm.ticketType
     })
+    buyVisible.value = false
     ElMessage.success(`下单成功，订单号 ${r.orderNo}（待支付）`)
     await goPay(r.requestId)
     await search()
   } catch (e) {
-    if (e === 'cancel') return
-    ElMessage.error(e.message || '已取消')
+    ElMessage.error(e.message || '下单失败')
+  } finally {
+    buying.value = false
   }
 }
 
@@ -126,12 +146,39 @@ async function goPay(requestId) {
       </el-table-column>
       <el-table-column label="操作" width="90">
         <template #default="{ row }">
-          <el-button size="small" type="primary" :disabled="row.remaining <= 0" @click="buy(row)">
+          <el-button size="small" type="primary" :disabled="row.remaining <= 0" @click="openBuy(row)">
             购票
           </el-button>
         </template>
       </el-table-column>
     </el-table>
+
+    <el-dialog v-model="buyVisible" title="确认购票" width="420px">
+      <div v-if="buyRow" class="buy-sum">
+        {{ buyRow.trainCode }} {{ buyRow.from }} -> {{ buyRow.to }}　{{ buyRow.seatClass }}　¥{{ yuan(buyRow.priceCents) }}
+      </div>
+      <el-form label-width="80px" style="margin-top: 12px">
+        <el-form-item label="乘车人">
+          <el-select v-model="buyForm.contactId" clearable placeholder="本人" style="width: 100%">
+            <el-option
+              v-for="c in contacts"
+              :key="c.id"
+              :label="c.age ? `${c.name}（${c.age} 岁）` : c.name"
+              :value="c.id"
+            />
+          </el-select>
+        </el-form-item>
+        <el-form-item label="票种">
+          <el-select v-model="buyForm.ticketType" style="width: 100%">
+            <el-option v-for="t in TICKET_TYPES" :key="t.value" :label="t.label" :value="t.value" />
+          </el-select>
+        </el-form-item>
+      </el-form>
+      <template #footer>
+        <el-button @click="buyVisible = false">取消</el-button>
+        <el-button type="primary" :loading="buying" @click="confirmBuy">确认购买</el-button>
+      </template>
+    </el-dialog>
   </div>
 </template>
 
@@ -139,4 +186,5 @@ async function goPay(requestId) {
 .panel { background: #fff; border: 1px solid var(--resv-line); padding: 16px; }
 .ok { color: #1e4e8c; }
 .no { color: #b0b8c2; }
+.buy-sum { color: #5f7083; font-size: 13px; }
 </style>

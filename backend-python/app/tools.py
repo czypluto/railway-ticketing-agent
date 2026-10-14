@@ -38,6 +38,7 @@ def buy_ticket_schema() -> dict:
             "from": {"type": "string", "description": "出发站名"},
             "to": {"type": "string", "description": "到达站名"},
             "ticketType": {"type": "string", "description": "票种：ADULT(默认)/CHILD/STUDENT", "enum": ["ADULT", "CHILD", "STUDENT"]},
+            "contactId": {"type": "integer", "description": "可选：常用联系人 id（来自 list_contacts）；不填则为本人。买儿童票时需传带儿童年龄的联系人"},
         },
         ["tripId", "seatClass", "from", "to"],
     )

@@ -1,7 +1,7 @@
 """调用 Java（铁路购票）的 REST 客户端。执行只走 REST，透传当前用户 Token。
 
 对应 Java 能力：
-  查车站 /api/rail/stations
+  查车站 /api/ticket/stations（只读；管理端的 /api/rail/stations 限 ADMIN）
   查票   /api/ticket/query
   下单   /api/ticket/buy
   我的订单/支付/退票  /api/ticket/orders/**
@@ -52,7 +52,7 @@ async def _call(method: str, path: str, body: Optional[dict] = None) -> Any:
 
 async def stations(kw: Optional[str] = None) -> list[dict]:
     qs = "" if not kw else "?" + urlencode({"kw": kw})
-    return await _call("GET", f"/api/rail/stations{qs}") or []
+    return await _call("GET", f"/api/ticket/stations{qs}") or []
 
 
 async def query_tickets(from_station: str, to_station: str, date: str, seat_class: Optional[str] = None) -> list[dict]:
@@ -66,7 +66,7 @@ async def query_tickets(from_station: str, to_station: str, date: str, seat_clas
 
 
 async def buy_ticket(trip_id: int, seat_class: str, from_station: str, to_station: str,
-                     ticket_type: str = "ADULT") -> dict:
+                     ticket_type: str = "ADULT", contact_id: Optional[int] = None) -> dict:
     from_id, to_id = await _resolve_station(from_station), await _resolve_station(to_station)
     body = {
         "tripId": trip_id,
@@ -74,6 +74,7 @@ async def buy_ticket(trip_id: int, seat_class: str, from_station: str, to_statio
         "fromStationId": from_id,
         "toStationId": to_id,
         "ticketType": ticket_type or "ADULT",
+        "contactId": contact_id,
     }
     return await _call("POST", "/api/ticket/buy", body)
 
