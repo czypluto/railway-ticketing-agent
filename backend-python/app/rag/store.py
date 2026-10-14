@@ -384,57 +384,70 @@ class RagStore:
             score += idf * (f * (k1 + 1.0)) / (f + k1 * (1.0 - b + b * dl / avgdl))
         return score
 
-    async def retrieve(self, query: str, department: str, top_k: int = 5) -> list[str]:
+    async def retrieve(self, query: str, department: str, top_k: int = 5,
+                       mode: str = "hybrid") -> list[str]:
         """混合召回提升命中率：
         1) 向量命中小段 → 按页去重（语义定位，保留部门过滤）；
         2) 中文 BM25 词面命中页（补回向量没打中的术语页）；
         3) RRF 融合两路排序，取 top_k 页整文返回。
+
+        ``mode`` 是给评测做消融用的显式开关，生产链路一律走默认值：
+        - ``hybrid``：向量 + BM25，RRF 融合（默认，即线上行为）
+        - ``vector``：只用向量路
+        - ``bm25``：只用关键词路
         """
         if not self.enabled:
             return []
 
         # 1) 向量路（键为 (来源, 页)，与页索引对齐）
         vec_rank: list[tuple[str, int]] = []
-        try:
-            qv = (await embed_texts([query]))[0]
-            expr = dept_filter_expr(department)
-            res = self._client.search(
-                collection_name=self._collection,
-                data=[qv],
-                limit=top_k * 4,
-                output_fields=["parent_id", "source"],
-                filter=expr,
-                search_params={"metric_type": "COSINE"},
-            )
-            seen: set[tuple[str, int]] = set()
-            for hit in res[0]:
-                ent = hit.get("entity") or {}
-                pid = ent.get("parent_id")
-                if pid is None:
-                    continue
-                key = (ent.get("source") or "", pid)
-                if key in seen:
-                    continue
-                seen.add(key)
-                vec_rank.append(key)
-        except Exception as e:  # noqa: BLE001
-            logger.warning("向量检索失败：%s", e)
+        if mode in ("hybrid", "vector"):
+            try:
+                qv = (await embed_texts([query]))[0]
+                expr = dept_filter_expr(department)
+                res = self._client.search(
+                    collection_name=self._collection,
+                    data=[qv],
+                    limit=top_k * 4,
+                    output_fields=["parent_id", "source"],
+                    filter=expr,
+                    search_params={"metric_type": "COSINE"},
+                )
+                seen: set[tuple[str, int]] = set()
+                for hit in res[0]:
+                    ent = hit.get("entity") or {}
+                    pid = ent.get("parent_id")
+                    if pid is None:
+                        continue
+                    key = (ent.get("source") or "", pid)
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    vec_rank.append(key)
+            except Exception as e:  # noqa: BLE001
+                logger.warning("向量检索失败：%s", e)
+
+        # 页索引在三种模式下都要建：向量路命中的键是 (来源, 页)，
+        # 最终取正文与出处也要靠它。只在 BM25 分支里建会让 mode="vector" 取不到正文、结果为空。
+        self._ensure_page_index()
 
         # 2) BM25 关键词路（补召回）
-        self._ensure_page_index()
         kw_rank: list[tuple[str, int]] = []
-        if self._page_index and self._total:
-            allowed = [key for key, r in self._page_index.items()
-                       if visible(r["dept"], department)]
-            qt = _zh_tokens(query)
-            if qt and allowed:
-                scored = []
-                for key in allowed:
-                    s = self._bm25(self._page_index[key], qt)
-                    if s > 0:
-                        scored.append((s, key))
-                scored.sort(key=lambda x: x[0], reverse=True)
-                kw_rank = [key for _, key in scored[:max(top_k * 2, 8)]]
+        if mode in ("hybrid", "bm25"):
+            if self._page_index and self._total:
+                allowed = [key for key, r in self._page_index.items()
+                           if visible(r["dept"], department)]
+                qt = _zh_tokens(query)
+                if qt and allowed:
+                    scored = []
+                    for key in allowed:
+                        s = self._bm25(self._page_index[key], qt)
+                        if s > 0:
+                            scored.append((s, key))
+                    # 并列时按 (来源, 页) 定序：Milvus query 返回的行序不保证稳定，
+                    # 用它当并列的隐式 tie-break 会让同一输入两次跑出不同结果（评测不可复现）。
+                    scored.sort(key=lambda x: (-x[0], x[1]))
+                    kw_rank = [key for _, key in scored[:max(top_k * 2, 8)]]
 
         # 3) RRF 融合
         k = 60
@@ -449,7 +462,9 @@ class RagStore:
                 score += 1.0 / (k + rank)
             return score
 
-        order = sorted(set(vec_rank) | set(kw_rank), key=_rrf, reverse=True)
+        # 并列时按 key 定序：set 的迭代顺序受解释器哈希随机化影响，
+        # 直接 reverse=True 会让同一输入两次跑出不同顺序（评测不可复现）。
+        order = sorted(set(vec_rank) | set(kw_rank), key=lambda k: (-_rrf(k), k))
         out: list[str] = []
         for key in order[:top_k]:
             rec = (self._page_index or {}).get(key)
