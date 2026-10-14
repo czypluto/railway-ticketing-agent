@@ -1,6 +1,8 @@
 // 与两个后端的通信。Java 登录/购票，Python 对话（SSE）。
 const TOKEN_KEY = 'resv_token'
 
+const USER_KEY = 'resv_user'
+
 async function jfetch(path, options = {}) {
   const resp = await fetch(path, {
     ...options,
@@ -10,8 +12,28 @@ async function jfetch(path, options = {}) {
       ...(options.headers || {})
     }
   })
-  const body = await resp.json()
-  if (body.code !== 0) throw new Error(body.msg || '请求失败')
+  // 后端异常时可能是空 body 或非 JSON，直接 resp.json() 会抛原生 SyntaxError，
+  // 用户只看到 "Unexpected end of JSON input" 而拿不到任何可用信息。
+  const raw = await resp.text()
+  let body = null
+  try {
+    body = raw ? JSON.parse(raw) : null
+  } catch {
+    body = null
+  }
+  if (!body) throw new Error(`服务异常（HTTP ${resp.status}），请稍后重试`)
+
+  if (body.code !== 0) {
+    // 登录态失效：清掉本地凭证并回到登录页，否则用户会卡在原地反复报错
+    if (resp.status === 401 || body.code === 401) {
+      const had = !!getToken()
+      clearToken()
+      localStorage.removeItem(USER_KEY)
+      if (had) location.reload()
+      throw new Error(body.msg || '登录已失效，请重新登录')
+    }
+    throw new Error(body.msg || '请求失败')
+  }
   return body.data
 }
 

@@ -14,6 +14,7 @@ const input = ref('')
 const sending = ref(false)
 const listRef = ref(null)
 let abort = null
+let stopped = false // 用户是否主动点了「停止」；用于区分“主动中断”与“服务无返回”
 
 const QUICK = [
   '帮我查明天北京南到上海虹桥的二等座',
@@ -63,7 +64,13 @@ async function send(text) {
   }
   const onDone = () => {
     sending.value = false
-    if (!current.text) {
+    if (stopped) {
+      // 主动停止不是失败：此前会被判成“服务未返回结果”弹红色报错
+      current.stage = ''
+      if (!current.text) current.text = '已停止。'
+      current.tone = 'normal'
+      stopped = false
+    } else if (!current.text) {
       current.stage = ''
       current.text = '服务未返回结果，请重试。'
       current.tone = 'error'
@@ -82,6 +89,7 @@ function onKeydown(e) {
 }
 
 function stopStream() {
+  stopped = true
   if (abort) abort()
   sending.value = false
 }
@@ -318,10 +326,7 @@ async function newConversation() {
   background: #f4f6f9;
   border: 1px solid #e6ebf1;
 }
-.msg-denied .bubble {
-  background: #fdf6ec;
-  border-color: #f5d7a0;
-}
+
 .msg-error .bubble {
   background: #fef0f0;
   border-color: #f3c2c2;
