@@ -73,6 +73,23 @@ def _clean(s: str) -> str:
     return s.replace("\\", "\\\\").replace('"', '\\"')[: _PARENT_MAX]
 
 
+def dept_filter_expr(department: str) -> str:
+    """向量检索路的 Milvus 标量过滤：可见 dept_tags 为 all 或本部门。
+
+    用户没有部门时退化为只听 all——即"没有部门的人只能看公开文档"。
+    """
+    return 'dept_tags in ["all", "%s"]' % _clean(department or "")
+
+
+def visible(dept_tags, department: str) -> bool:
+    """BM25 路过滤，语义必须与 dept_filter_expr 保持一致。
+
+    记录未声明部门时入库为 all（全员可见）；用户没有部门时只能看到 all。
+    """
+    d = (department or "").strip()
+    return ("all" in dept_tags) or (bool(d) and d in dept_tags)
+
+
 # ---- 中文词面检索：CJK 用重叠 bigram，英文/数字整词；无需分词依赖，规则/条款术语命中稳定 ----
 _CJK_RUN = re.compile(r"[一-鿿]+|[a-z0-9]+")
 
@@ -365,7 +382,7 @@ class RagStore:
         vec_rank: list[int] = []
         try:
             qv = (await embed_texts([query]))[0]
-            expr = 'dept_tags in ["all", "%s"]' % _clean(department)
+            expr = dept_filter_expr(department)
             res = self._client.search(
                 collection_name=self._collection,
                 data=[qv],
@@ -389,7 +406,7 @@ class RagStore:
         kw_rank: list[int] = []
         if self._page_index and self._total:
             allowed = [pid for pid, r in self._page_index.items()
-                       if "all" in r["dept"] or department in r["dept"]]
+                       if visible(r["dept"], department)]
             qt = _zh_tokens(query)
             if qt and allowed:
                 scored = []
