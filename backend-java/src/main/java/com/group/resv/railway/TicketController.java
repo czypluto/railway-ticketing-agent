@@ -60,6 +60,12 @@ public class TicketController {
         return ApiResult.ok(ticketService.query(from, to, date, seatClass));
     }
 
+    @Operation(summary = "车站列表", description = "只读；供购票页与 Agent 把站名解析为 stationId（鉴权即可访问，不限 ADMIN）")
+    @GetMapping("/stations")
+    public ApiResult<List<Map<String, Object>>> stations(@RequestParam(required = false) String kw) {
+        return ApiResult.ok(ticketService.stations(kw));
+    }
+
     @Operation(summary = "购票", description = "锁定库存并生成待支付订单（幂等，同人同车次同席别防重复）")
     @PostMapping("/buy")
     public ApiResult<Map<String, Object>> buy(@Valid @RequestBody TicketService.BuyRequest req) {

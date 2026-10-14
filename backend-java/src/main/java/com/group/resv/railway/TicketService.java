@@ -129,6 +129,19 @@ public class TicketService {
         return out;
     }
 
+    /**
+     * 车站只读列表：购票页与 Agent 都需要把「站名」解析成 stationId。
+     * 管理端的 /api/rail/stations 是 ADMIN-only，普通用户拿不到；这里只暴露只读查询。
+     */
+    public List<Map<String, Object>> stations(String kw) {
+        List<Station> list = kw == null || kw.isBlank()
+                ? stationRepository.findAll()
+                : stationRepository.findByNameContainingOrderByIdAsc(kw);
+        return list.stream()
+                .map(s -> Map.<String, Object>of("id", s.getId(), "code", s.getCode(), "name", s.getName()))
+                .toList();
+    }
+
     // ---------- 下单 ----------
 
     public record BuyRequest(
