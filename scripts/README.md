@@ -9,24 +9,35 @@
 | `start-dev.sh` | 只拉起后端（Redis/MySQL + Java + Python），不启前端与嵌入；首次运行自动建 venv 装依赖 |
 | `stop-dev.sh` | 停 Windows 侧 Java/Python（保留容器） |
 | `reset-demo.sh` | 清订单 + 清 Redis，演示数据回到初始（无需重启 Java） |
-| `e2e_smoke.py` | Java 端到端冒烟（登录/权限/越权拦截/抢票/幂等/落库） |
-| `chat_e2e.py` | 对话链路联调：登录(Java) → Python SSE → 真实 DeepSeek；用法 `python chat_e2e.py <账号> <话>` |
+
+## 联调脚本
+
+| 脚本 | 作用 |
+|---|---|
+| `rail_smoke.py` | **Java 交易链路端到端冒烟**：登录 → 车站 → 余票查询 → 下单 → 异步落库 → 支付 → 退票 → 余票回补校验 |
+| `chat_e2e.py` | **对话链路联调**：登录(Java) → Python `/api/chat`(SSE) → 真实 DeepSeek；打印每条 SSE 事件及其 `model` 字段。用法 `python chat_e2e.py <账号> "<话>"` |
+| `rag_test.py` | RAG 冒烟：灌入 `data/docs` 并做一次带部门过滤的检索（需嵌入服务 8001 在跑） |
+| `rag_query.py` | 只看检索命中、不灌库。用法 `python rag_query.py "<问题>" [部门]` |
+| `ingest_pdf_cli.py` / `ingest_pdf_pages.py` | PDF 命令行入库（整页渲染成图走多模态嵌入） |
+| `wemm_test.py` | 探测 WeMM-Embedding-2B 能否在本机以 int8/4bit 加载并产出 1024 维嵌入 |
 
 示例：
 
 ```bash
 bash scripts/start-dev.sh
-bash scripts/chat_e2e.py zhanggong "帮我预约员工班车座位"
+python scripts/rail_smoke.py
+python scripts/chat_e2e.py zhanggong "帮我查明天北京南到上海虹桥的二等座"
 bash scripts/reset-demo.sh
 ```
 
-## 手动静默步骤（对应 docs/技术方案-v2.md §9.4）
+## 手动启动步骤（对应 `docs/架构设计.md` §9）
 
 1. WSL2 就绪（`.wslconfig` 12GB，`wsl --shutdown` 后重启）
 2. `cd infra && docker compose up -d`
 3. `cd backend-java && mvn spring-boot:run`
-4. `cd backend-python && uvicorn app.main:app --port 8000`
-5. `cd frontend-vue && npm run dev`
+4. `cd backend-python && uvicorn app.embed.server:app --port 8001`（嵌入服务）
+5. `cd backend-python && uvicorn app.main:app --port 8000`
+6. `cd frontend-vue && npm run dev`
 
 ## 说明
 

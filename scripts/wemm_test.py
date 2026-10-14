@@ -13,7 +13,7 @@ def try_st(quant=None, name="plain"):
         cfg["load_in_8bit" if quant == 8 else "load_in_4bit"] = True
         kw["quantization_config"] = BitsAndBytesConfig(**cfg)
     m = SentenceTransformer(MODEL, device="cuda", trust_remote_code=True, model_kwargs=kw)
-    v = m.encode(["总裁班车仅限高管预约"], normalize_embeddings=True, truncate_dim=1024)
+    v = m.encode(["学生票仅限动车组二等座且限寒暑假乘车"], normalize_embeddings=True, truncate_dim=1024)
     return name, v.shape, [round(float(x), 4) for x in v[0][:4]]
 
 

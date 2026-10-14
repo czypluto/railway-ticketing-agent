@@ -18,7 +18,7 @@ pytest==9.1.1
 
 # 说明
 # - 模型路由（DeepSeek API）只依赖 httpx，业务代码不出现模型名。
-# - vLLM 提供本地 Qwen3-Embedding 的 OpenAI 兼容接口，Python 侧用 httpx 调 /v1/embeddings。
+# - 本地嵌入由 app/embed/server.py 独立提供 OpenAI 兼容的 /v1/embeddings，Python 侧用 httpx 调它。
 
 # 当前对话记忆（可省略：省略则退回进程内存）
 redis>=5.0

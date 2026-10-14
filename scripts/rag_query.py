@@ -9,7 +9,7 @@ from app.rag.store import RagStore  # noqa: E402
 
 
 async def main() -> None:
-    query = sys.argv[1] if len(sys.argv) > 1 else "会议室预约以多长时间为最小单位"
+    query = sys.argv[1] if len(sys.argv) > 1 else "开车前3天退票手续费收多少"
     dept = sys.argv[2] if len(sys.argv) > 2 else "技术部"
     store = RagStore()
     print("rag.enabled =", store.enabled)

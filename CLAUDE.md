@@ -1,19 +1,20 @@
 # 工程约定
 
-面向「铁路购票系统」。完整方案见 `docs/技术方案-v2.md`，改代码前先读它。
+面向「铁路购票系统」。完整方案见 `docs/架构设计.md`，改代码前先读它。
 
 ## 技术栈
 
 - 前端：Vue 3 + Vite + Element Plus
 - Java 后端：Spring Boot 3（内嵌 Tomcat）、JDK 17、Maven
-- Python 后端：FastAPI + vLLM（仅本地 embedding）+ Milvus Lite + 模型路由（DeepSeek 官网 API）
+- Python 后端：FastAPI + Milvus Lite + 模型路由（DeepSeek 官网 API）
+- 本地嵌入：独立的 FastAPI 服务（`backend-python/app/embed/`，端口 8001），用 transformers 直接加载 WeMM-Embedding-2B（int8 GPU，MRL 截 1024 维）或 bge-m3（CPU），对外暴露 OpenAI 兼容 `/v1/embeddings`
 - 中间件：Redis（缓存/分布式锁/Stream）、MySQL 8
 - 运行时：全部服务在 WSL2 内，Windows 只跑 IDE 与浏览器
 
 ## 目录结构
 
 ```
-docs/            方案文档（技术方案-v2.md）
+docs/            设计文档（架构设计.md）
 infra/           docker-compose、初始化 SQL、.wslconfig 说明
 backend-java/    Spring Boot 3 服务
 backend-python/  FastAPI 服务
@@ -42,8 +43,8 @@ scripts/         启动/联调脚本
 ## 后端约定
 
 - Java base package：`com.group.resv`；接口统一 `/api/**`。
-- 权限放行只由 Java 规则表做确定性判定（不经过 LLM）；模型只负责把结论解释给用户。
-- 工具能力注册与 REST 单一来源：Python 只经 REST 调 Java；`@Tool`/MCP 仅登记能力元数据，启动时校验"注册的工具都有对应 REST 接口"，防双契约漂移。
+- 权限放行与政策校验只由 Java 确定性规则层判定（`railway/TicketPolicy.java`，不经过 LLM）；模型只负责把结论解释给用户。
+- 工具与 REST 单一来源：Python 只经 REST 调 Java（`app/java_client.py`），不直连业务库。工具 schema 在 `app/tools.py` 手工维护，与 Java 接口的对应关系目前靠人工同步（未实现启动时自动校验，属待办）。
 - Python：Token 校验失败即 401，不进入 RAG、不调 Java。
 
 ## 前端与文案口味
@@ -53,7 +54,7 @@ scripts/         启动/联调脚本
 
 ## 启动顺序
 
-见 `docs/技术方案-v2.md` §9.4 与 `scripts/`。核心：WSL2（`.wslconfig` 12GB）→ `infra/` 起 Redis+MySQL → Java → Python → 前端。
+见 `docs/架构设计.md` §9 与 `scripts/`。核心：WSL2（`.wslconfig` 12GB）→ `infra/` 起 Redis+MySQL → Java → 嵌入服务(8001) → Python → 前端。
 
 ## 提交
 

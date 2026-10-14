@@ -1,24 +1,53 @@
 # backend-java
 
-Java 交易服务（Spring Boot 3，端口 8080）。
+购票交易服务（Spring Boot 3，端口 8080）。
 
 ## 能力
 
-- 登录签发 JWT（HS256，与 Python 共用 `JWT_SECRET`）
-- 权限规则表确定性校验（`/api/perms/check`），不依赖大模型
-- 抢票：令牌桶限流 → 幂等 → Redis+Lua 扣库存 → Stream 异步落库
-- 工具目录与 REST 单一来源，启动时校验对齐（`ToolRestValidator`）
+- 登录/注册签发 JWT（HS256，与 Python 共用 `JWT_SECRET`）
+- 购票交易：令牌桶限流 → 幂等 → Redis + Lua 原子扣库存 → Redis Stream 异步落库
+- 确定性购票规则层（`railway/TicketPolicy.java`）：过期车次、一人一票、儿童票年龄、学生票资格、支付/退票状态机幂等
+- 余票预热（按「总席位 − 在售订单」回填，防重启超卖）、座次原子分配（Redis 递增）
+- 铁路数据管理（车站/列车/经停/车次/席别），仅 `ADMIN` 可操作，高危写操作需一次性确认码
+- 操作审计日志（`audit/`）
 
 ## 关键接口
 
+**认证**
+
 | 方法 | 路径 | 说明 |
 |---|---|---|
-| POST | /api/auth/login | 登录，返回 JWT |
-| GET  | /api/resources | 资源列表 |
-| POST | /api/perms/check | 权限校验（Python/Agent 交易前调用） |
-| POST | /api/seckill | 抢票/预约 |
-| GET  | /api/orders/{requestId} | 订单查询（异步落库后确认） |
-| POST | /api/resources/{id}/preheat | 手工预热库存 |
+| POST | `/api/auth/login` | 登录，返回 JWT |
+| POST | `/api/auth/register` | 注册 |
+
+**购票**
+
+| 方法 | 路径 | 说明 |
+|---|---|---|
+| GET  | `/api/ticket/query` | 余票查询（Python/Agent 查票调用） |
+| POST | `/api/ticket/buy` | 下单（返回 requestId，异步落库） |
+| POST | `/api/ticket/orders/{requestId}/pay` | 支付 |
+| POST | `/api/ticket/orders/{requestId}/cancel` | 退票 |
+| GET  | `/api/ticket/orders/my` | 我的订单 |
+| GET  | `/api/ticket/orders/request/{requestId}` | 按 requestId 查订单 |
+
+**用户资料**
+
+| 方法 | 路径 | 说明 |
+|---|---|---|
+| GET/PUT | `/api/user/profile` | 资料读写 |
+| GET/POST | `/api/user/contacts` | 乘车人列表/新增 |
+| PUT/DELETE | `/api/user/contacts/{id}` | 修改/删除乘车人 |
+
+**铁路数据管理**（`@PreAuthorize("hasRole('ADMIN')")`）
+
+| 方法 | 路径 |
+|---|---|
+| GET/POST | `/api/rail/stations` |
+| GET/POST | `/api/rail/trains`　PUT/DELETE `/api/rail/trains/{id}` |
+| POST | `/api/rail/trains/{id}/stops` |
+| GET/POST | `/api/rail/trips`　GET/DELETE `/api/rail/trips/{id}` |
+| POST | `/api/rail/confirm/request`（高危操作换取一次性确认码） |
 
 ## 运行
 
@@ -28,10 +57,10 @@ Java 交易服务（Spring Boot 3，端口 8080）。
 mvn spring-boot:run
 ```
 
-演示账号（密码均 `123456`）：
+演示账号（`DataInitializer` 初始化，密码均 `123456`）：
 
-| 账号 | 部门 | 职级 | 可验证场景 |
+| 账号 | 姓名 | 角色 | 说明 |
 |---|---|---|---|
-| wangzong | 综合管理部 | 高管 | 可约总裁班车（EXEC_SHUTTLE） |
-| zhanggong | 技术部 | 高级工程师 | 约总裁班车被拒（403） |
-| lizhu | 人事部 | 实习生 | 同上；可约员工班车 |
+| wangzong | 王建国 | ADMIN | 可访问 `/api/rail/**` 管理接口 |
+| zhanggong | 张伟 | EMPLOYEE | 仅业务接口，访问管理接口返回 403 |
+| lizhu | 李琳 | EMPLOYEE | 同上 |

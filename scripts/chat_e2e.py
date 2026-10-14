@@ -1,6 +1,6 @@
 """对话链路联调：登录(Java) -> Python /api/chat(SSE) -> 真实 DeepSeek 意图识别。
 
-用法：.venv/Scripts/python ../scripts/chat_e2e.py  （前置：Java/Python 已起、.env 有 key）
+用法：.venv/Scripts/python ../scripts/chat_e2e.py [账号] [话]  （前置：Java/Python 已起、.env 有 key）
 """
 import json
 import os
@@ -13,6 +13,15 @@ import httpx
 # JAVA_BASE 可用环境变量覆盖（如 Python 跑在 WSL 时指向 Windows 网关）
 JAVA = os.environ.get("JAVA_BASE", "http://127.0.0.1:8080")
 PY = "http://127.0.0.1:8000"
+
+# 后端实际推送的 SSE 事件类型（见 app/agent/orchestrator.py 的 _event 调用）
+EVENT_MARK = {
+    "think": "[思考]",
+    "result": "[结果]",
+    "answer": "[答复]",
+    "confirm": "[待确认]",
+    "error": "[错误]",
+}
 
 
 def login(username):
@@ -50,9 +59,7 @@ def chat(token, message):
                     except json.JSONDecodeError:
                         continue
                     kind = ev.get("kind")
-                    mark = {"think": "[思考]", "check": "[权限]", "act": "[抢票]",
-                            "answer": "[答复]", "result": "[结果]", "denied": "[拒绝]",
-                            "error": "[错误]"}.get(kind, f"[{kind}]")
+                    mark = EVENT_MARK.get(kind, f"[{kind}]")
                     print(f"  {mark} model={ev.get('model','-')}")
                     if ev.get("text"):
                         print(f"       {ev['text']}")
@@ -60,7 +67,7 @@ def chat(token, message):
 
 def main():
     user = sys.argv[1] if len(sys.argv) > 1 else "zhanggong"
-    msg = sys.argv[2] if len(sys.argv) > 2 else "帮我预约员工班车座位"
+    msg = sys.argv[2] if len(sys.argv) > 2 else "帮我查明天北京南到上海虹桥的二等座"
     token = login(user)
     chat(token, msg)
 

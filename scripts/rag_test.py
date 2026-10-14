@@ -20,7 +20,7 @@ async def main() -> None:
         return
     n = await store.ingest_dir()
     print("ingested paragraphs =", n)
-    hits = await store.retrieve("实习生能预约总裁班车吗", "技术部", top_k=3)
+    hits = await store.retrieve("学生票有什么优惠条件", "技术部", top_k=3)
     print("hits =", len(hits))
     for h in hits:
         print(" -", h[:80])
