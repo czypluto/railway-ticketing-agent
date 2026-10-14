@@ -100,8 +100,18 @@ public class TicketInflightReconcileJob {
             stockService.release(tripId, seatClass);
             redis.delete(RailwayKeys.active(userId, tripId));
             redis.opsForZSet().remove(RailwayKeys.inflightIndex(), requestId);
-            log.error("在途购票 {} 超过 {} 分钟仍未落库，已回补余票并释放占位（异步落库失败补偿）",
-                    requestId, GRACE.toMinutes());
+
+            // 收尾再核对一次：兜住极窄窗口——消费端在我判 DB（无单）之后、
+            // 墓碑真正生效之前把订单插了进去。若不撤销，会变成「订单存在、余票却多一张」。
+            if (orderRepository.findByRequestId(requestId).isPresent()) {
+                stockService.decr(tripId, seatClass);
+                redis.opsForValue().setIfAbsent(
+                        RailwayKeys.active(userId, tripId), "1", KEEP);
+                log.warn("在途购票 {} 在对账瞬间落库成功，已撤销回补并恢复一人一票占位", requestId);
+            } else {
+                log.error("在途购票 {} 超过 {} 分钟仍未落库，已回补余票并释放占位（异步落库失败补偿）",
+                        requestId, GRACE.toMinutes());
+            }
         } catch (Exception e) {
             // 补偿失败：回滚墓碑，让下一轮重试。否则会留下"有墓碑、没回补"的隐形泄漏。
             redis.opsForValue().set(key, detail, KEEP);
