@@ -19,7 +19,9 @@ import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.stereotype.Component;
 
 import java.time.Duration;
+import java.time.Instant;
 import java.time.LocalDateTime;
+import java.time.ZoneId;
 import java.util.List;
 import java.util.Map;
 
@@ -148,7 +150,13 @@ public class TicketOrderConsumer implements ApplicationRunner {
         o.setPassengerId(str(body.get("passengerId")));
         o.setPriceCents(Long.parseLong(str(body.get("priceCents"))));
         o.setStatus(TicketOrder.PENDING);
-        o.setCreatedAt(LocalDateTime.now());
+        // 用事件里的下单时刻，而不是消费时刻：否则 10 分钟支付窗口从"落库"起算，
+        // 消费延迟越大留给用户的支付时间越短，与产品语义不符。
+        String createdAtMs = str(body.get("createdAt"));
+        o.setCreatedAt(createdAtMs == null || createdAtMs.isEmpty()
+                ? LocalDateTime.now()
+                : LocalDateTime.ofInstant(Instant.ofEpochMilli(Long.parseLong(createdAtMs)),
+                        ZoneId.systemDefault()));
         try {
             orderRepository.save(o);
         } catch (DataIntegrityViolationException e) {

@@ -275,6 +275,8 @@ public class TicketService {
             event.put("passengerAge", passengerAge == null ? "" : String.valueOf(passengerAge));
             event.put("seatNo", String.valueOf(seatNo));
             event.put("priceCents", String.valueOf(priceCents));
+            // 下单时刻随事件落库：支付窗口应从"下单"起算，而不是从"落库"起算
+            event.put("createdAt", String.valueOf(System.currentTimeMillis()));
             // 在途登记：库存已扣、订单尚未落库。消费端落库成功后销掉；若长期未销，
             // 由 TicketInflightReconcileJob 回补余票——否则异步落库失败会让余票永久泄漏。
             // 必须写在 XADD 之前，这样 XADD 失败时也能立刻回补。
