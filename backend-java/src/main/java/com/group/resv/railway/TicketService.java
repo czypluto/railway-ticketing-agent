@@ -275,10 +275,24 @@ public class TicketService {
             event.put("passengerAge", passengerAge == null ? "" : String.valueOf(passengerAge));
             event.put("seatNo", String.valueOf(seatNo));
             event.put("priceCents", String.valueOf(priceCents));
+            // 在途登记：库存已扣、订单尚未落库。消费端落库成功后销掉；若长期未销，
+            // 由 TicketInflightReconcileJob 回补余票——否则异步落库失败会让余票永久泄漏。
+            // 必须写在 XADD 之前，这样 XADD 失败时也能立刻回补。
+            String inflightKey = RailwayKeys.inflight(requestId);
+            long nowMs = System.currentTimeMillis();
+            redis.opsForValue().set(inflightKey,
+                    trip.getId() + "|" + tc.getSeatClass() + "|" + user.userId() + "|" + nowMs,
+                    Duration.ofMinutes(15));
+            redis.opsForZSet().add(RailwayKeys.inflightIndex(), requestId, nowMs);
             try {
                 redis.opsForStream().add(RailwayKeys.orderStream(), event);
             } catch (RuntimeException e) {
-                redis.delete(activeKey); // 落库失败前释放占位，避免死锁
+                // 写 Stream 失败 = 本次购买作废：占位、在途登记、**以及已扣的库存**都要还回去。
+                // （此前只释放了占位，扣掉的那张票会永久泄漏）
+                redis.delete(activeKey);
+                redis.delete(inflightKey);
+                redis.opsForZSet().remove(RailwayKeys.inflightIndex(), requestId);
+                stockService.release(trip.getId(), tc.getSeatClass());
                 throw e;
             }
 

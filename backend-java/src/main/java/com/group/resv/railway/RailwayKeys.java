@@ -24,4 +24,21 @@ public final class RailwayKeys {
     public static String seatSeq(Long tripId, String seatClass) {
         return "rv:seat:" + tripId + ":" + seatClass;
     }
+
+    /**
+     * 在途购票登记索引（ZSET：member=requestId，score=下单毫秒时间戳）。
+     * 用于对账任务按"超时未落库"扫描，避免异步落库失败造成余票永久泄漏。
+     */
+    public static String inflightIndex() {
+        return "rv:inflight:idx";
+    }
+
+    /**
+     * 单笔在途购票详情：`tripId|seatClass|userId|下单毫秒`。
+     * 消费端落库成功后删除；对账任务判定投递失败后改写为 `cancelled` 墓碑，
+     * 消费端据此丢弃迟到的事件，防止"补偿完又被插进来"。
+     */
+    public static String inflight(String requestId) {
+        return "rv:inflight:" + requestId;
+    }
 }

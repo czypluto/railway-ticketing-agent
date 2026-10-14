@@ -30,6 +30,9 @@ public class TicketOrderConsumer implements ApplicationRunner {
 
     private static final Logger log = LoggerFactory.getLogger(TicketOrderConsumer.class);
 
+    /** 对账任务判定投递失败、并已回补余票后写入的墓碑值。消费端见到它就丢弃迟到的事件。 */
+    private static final String TOMBSTONE = "cancelled";
+
     private final StringRedisTemplate redis;
     private final TicketOrderRepository orderRepository;
     private final String streamKey = RailwayKeys.orderStream();
@@ -116,7 +119,14 @@ public class TicketOrderConsumer implements ApplicationRunner {
         if (requestId == null || requestId.isEmpty()) {
             return;
         }
+        if (TOMBSTONE.equals(redis.opsForValue().get(RailwayKeys.inflight(requestId)))) {
+            // 已被对账任务判定为投递失败，且余票已回补：丢弃这个迟到的事件。
+            // 否则会出现「先补偿、后插单」——库存与订单对不上。
+            log.warn("订单 {} 已被对账判定失败并回补余票，丢弃该事件", requestId);
+            return;
+        }
         if (orderRepository.findByRequestId(requestId).isPresent()) {
+            cleanupInflight(requestId);
             return;
         }
         TicketOrder o = new TicketOrder();
@@ -143,6 +153,17 @@ public class TicketOrderConsumer implements ApplicationRunner {
             orderRepository.save(o);
         } catch (DataIntegrityViolationException e) {
             // 重复落库，容忍
+        }
+        cleanupInflight(requestId);
+    }
+
+    /** 落库成功（或订单已存在）后销掉在途登记，对账任务就不会再把它当成失败去补偿。 */
+    private void cleanupInflight(String requestId) {
+        try {
+            redis.delete(RailwayKeys.inflight(requestId));
+            redis.opsForZSet().remove(RailwayKeys.inflightIndex(), requestId);
+        } catch (Exception e) {
+            log.warn("清理在途登记失败（对账任务会兜底）：{}", e.getMessage());
         }
     }
 
