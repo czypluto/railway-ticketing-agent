@@ -51,8 +51,46 @@ def chunk_sentences(text: str, max_len: int = 200, min_len: int = 30) -> list[st
     return out
 
 
-def _load_markdown(path: Path) -> list[Page]:
-    text = path.read_text(encoding="utf-8")
+_META_LINE = re.compile(r"^\s*(dept_tags|tags|visibility)\s*:\s*(.+)$", re.IGNORECASE)
+
+
+def read_frontmatter(text: str) -> tuple[list[str], str]:
+    """从 markdown 开头读取可见性元数据。
+
+    支持两种写法：
+      1) 顶部 --- front matter --- 块；
+      2) 正文前连续 "dept_tags: xx" 行（不顶到 --- 也行）。
+    返回 (tags, 剥离元数据后的正文)。未声明默认 ["all"]；声明含 all 则整体视为全公开。
+    """
+    lines = text.split("\n")
+    fm = bool(lines and lines[0].strip() == "---")
+    tags: list[str] = []
+    consumed = 0
+    i = 0 if not fm else 1
+    while i < len(lines):
+        line = lines[i].strip()
+        if line == "---" and fm:
+            consumed = i + 1
+            break
+        m = _META_LINE.match(line)
+        if m:
+            vals = [v.strip() for v in re.split(r"[,，、;；\s]+", m.group(2)) if v.strip()]
+            tags.extend(vals)
+            consumed = i + 1
+            i += 1
+            continue
+        if fm:
+            i += 1  # front matter 内非元数据行忽略
+            continue
+        break  # 非 front matter：遇正文即停
+    if not tags:
+        tags = ["all"]
+    if "all" in [t.lower() for t in tags]:
+        tags = ["all"]
+    return tags, "\n".join(lines[consumed:]).strip()
+
+
+def _split_markdown(text: str) -> list[Page]:
     pages: list[Page] = []
     cur_head = ""
     buf: list[str] = []
@@ -69,6 +107,11 @@ def _load_markdown(path: Path) -> list[Page]:
     if buf:
         pages.append(Page("\n".join(buf).strip(), len(pages) + 1, cur_head))
     return [p for p in pages if p.text]
+
+
+def _load_markdown(path: Path) -> list[Page]:
+    """按文件读入 markdown（load_pages 用）；需要剥离元数据请走 _split_markdown。"""
+    return _split_markdown(path.read_text(encoding="utf-8"))
 
 
 def _load_docx(path: Path) -> list[Page]:
