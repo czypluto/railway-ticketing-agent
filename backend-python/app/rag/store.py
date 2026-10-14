@@ -90,6 +90,45 @@ def visible(dept_tags, department: str) -> bool:
     return ("all" in dept_tags) or (bool(d) and d in dept_tags)
 
 
+def build_page_index(rows: list[dict]) -> tuple[dict, dict, int, float]:
+    """由 Milvus 行构造「页」级索引，返回 (pages, df, total, avgdl)。
+
+    **key 必须是 (来源, parent_id)**：parent_id 是每个文档各自从 1 开始编号的，
+    只用 parent_id 会让不同文档的同号页互相覆盖——正文丢失、部门标签串味、
+    检索结果张冠李戴。抽成纯函数是为了能被单测钉住（见 tests/test_rag_index.py）。
+    """
+    pages: dict = {}
+    for r in rows:
+        pid = r.get("parent_id")
+        if pid is None:
+            continue
+        src = r.get("source") or ""
+        key = (src, pid)
+        rec = pages.get(key)
+        if rec is None:
+            rec = {
+                "text": r.get("parent_text") or "",
+                "dept": set(),
+                "source": src,
+                "page_no": r.get("page_no"),
+                "heading": r.get("heading") or "",
+                "tf": {},
+                "dl": 0,
+            }
+            pages[key] = rec
+        rec["dept"].add(r.get("dept_tags") or "all")
+
+    df: dict = {}
+    for rec in pages.values():
+        rec["tf"] = _count_tokens(rec["text"])
+        rec["dl"] = sum(rec["tf"].values())
+        for t in rec["tf"]:
+            df[t] = df.get(t, 0) + 1
+    total = len(pages)
+    avgdl = (sum(r["dl"] for r in pages.values()) / total) if total else 0.0
+    return pages, df, total, avgdl
+
+
 # ---- 中文词面检索：CJK 用重叠 bigram，英文/数字整词；无需分词依赖，规则/条款术语命中稳定 ----
 _CJK_RUN = re.compile(r"[一-鿿]+|[a-z0-9]+")
 
@@ -312,10 +351,12 @@ class RagStore:
 
     # ---------------- 混合检索：向量 + 中文 BM25，RRF 融合 ----------------
     def _ensure_page_index(self) -> None:
-        """懒加载“页”级关键词索引（Big 粒度）。增删文档后调用方把 _page_index 置 None 即触发重建。"""
+        """懒加载“页”级关键词索引（Big 粒度），key 为 (来源, parent_id)。
+
+        增删文档后调用方把 _page_index 置 None 即触发重建。
+        """
         if self._page_index is not None or not (self.enabled and self._collection):
             return
-        pages: dict = {}
         try:
             rows = self._client.query(
                 collection_name=self._collection,
@@ -325,33 +366,7 @@ class RagStore:
         except Exception as e:  # noqa: BLE001
             logger.warning("加载关键词索引失败：%s", e)
             rows = []
-        for r in rows:
-            pid = r.get("parent_id")
-            if pid is None:
-                continue
-            rec = pages.get(pid)
-            if rec is None:
-                rec = {
-                    "text": r.get("parent_text") or "",
-                    "dept": set(),
-                    "source": r.get("source") or "",
-                    "page_no": r.get("page_no"),
-                    "heading": r.get("heading") or "",
-                    "tf": {},
-                    "dl": 0,
-                }
-                pages[pid] = rec
-            rec["dept"].add(r.get("dept_tags") or "all")
-        df: dict = {}
-        for rec in pages.values():
-            rec["tf"] = _count_tokens(rec["text"])
-            rec["dl"] = sum(rec["tf"].values())
-            for t in rec["tf"]:
-                df[t] = df.get(t, 0) + 1
-        self._page_index = pages
-        self._df = df
-        self._total = len(pages)
-        self._avgdl = (sum(r["dl"] for r in pages.values()) / len(pages)) if pages else 0.0
+        self._page_index, self._df, self._total, self._avgdl = build_page_index(rows)
 
     def _bm25(self, rec: dict, query_tokens: list[str]) -> float:
         k1, b = 1.5, 0.75
@@ -378,8 +393,8 @@ class RagStore:
         if not self.enabled:
             return []
 
-        # 1) 向量路
-        vec_rank: list[int] = []
+        # 1) 向量路（键为 (来源, 页)，与页索引对齐）
+        vec_rank: list[tuple[str, int]] = []
         try:
             qv = (await embed_texts([query]))[0]
             expr = dept_filter_expr(department)
@@ -387,44 +402,48 @@ class RagStore:
                 collection_name=self._collection,
                 data=[qv],
                 limit=top_k * 4,
-                output_fields=["parent_id"],
+                output_fields=["parent_id", "source"],
                 filter=expr,
                 search_params={"metric_type": "COSINE"},
             )
-            seen: set[int] = set()
+            seen: set[tuple[str, int]] = set()
             for hit in res[0]:
-                pid = (hit.get("entity") or {}).get("parent_id")
-                if pid is None or pid in seen:
+                ent = hit.get("entity") or {}
+                pid = ent.get("parent_id")
+                if pid is None:
                     continue
-                seen.add(pid)
-                vec_rank.append(pid)
+                key = (ent.get("source") or "", pid)
+                if key in seen:
+                    continue
+                seen.add(key)
+                vec_rank.append(key)
         except Exception as e:  # noqa: BLE001
             logger.warning("向量检索失败：%s", e)
 
         # 2) BM25 关键词路（补召回）
         self._ensure_page_index()
-        kw_rank: list[int] = []
+        kw_rank: list[tuple[str, int]] = []
         if self._page_index and self._total:
-            allowed = [pid for pid, r in self._page_index.items()
+            allowed = [key for key, r in self._page_index.items()
                        if visible(r["dept"], department)]
             qt = _zh_tokens(query)
             if qt and allowed:
                 scored = []
-                for pid in allowed:
-                    s = self._bm25(self._page_index[pid], qt)
+                for key in allowed:
+                    s = self._bm25(self._page_index[key], qt)
                     if s > 0:
-                        scored.append((s, pid))
+                        scored.append((s, key))
                 scored.sort(key=lambda x: x[0], reverse=True)
-                kw_rank = [pid for _, pid in scored[:max(top_k * 2, 8)]]
+                kw_rank = [key for _, key in scored[:max(top_k * 2, 8)]]
 
         # 3) RRF 融合
         k = 60
 
-        def _rrf(pid: int) -> float:
+        def _rrf(key: tuple[str, int]) -> float:
             score = 0.0
             for lst in (vec_rank, kw_rank):
                 try:
-                    rank = lst.index(pid) + 1
+                    rank = lst.index(key) + 1
                 except ValueError:
                     continue
                 score += 1.0 / (k + rank)
@@ -432,8 +451,8 @@ class RagStore:
 
         order = sorted(set(vec_rank) | set(kw_rank), key=_rrf, reverse=True)
         out: list[str] = []
-        for pid in order[:top_k]:
-            rec = (self._page_index or {}).get(pid)
+        for key in order[:top_k]:
+            rec = (self._page_index or {}).get(key)
             if not rec:
                 continue
             text = (rec.get("text") or "").strip()
