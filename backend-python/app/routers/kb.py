@@ -3,12 +3,13 @@
 - 上传：base64 JSON（文件名 + 内容）保存到 data/docs 后只灌该文件；store.ingest_file 先删同名旧向量，天然可替换。
 - md 顶部可用 front matter / 连续行声明 dept_tags 做部门可见性，入库自动剥离。
 - 每次写操作与被拒绝的越权尝试都落审计（app/audit.py，JSONL）。
-- 返回统一 {code, msg, data}，与前端 jfetch 约定一致。
+- 返回统一 {code, msg, data}；成功 200，失败用真实 HTTP 状态码（与 Java 侧一致）。
 """
 import base64
 from pathlib import PurePosixPath
 
 from fastapi import APIRouter, Query
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
 from .. import audit, config
@@ -36,7 +37,13 @@ def _ok(data):
 
 
 def _err(code: int, msg: str):
-    return {"code": code, "msg": msg, "data": None}
+    """错误返回**真实 HTTP 状态码** + 统一 body。
+
+    此前一律返回 200、只把错误写在 body.code 里，与 JWT 中间件（真 401）和 Java
+    侧（真 4xx）都不一致，日志/网关/监控看不出这是失败请求。
+    """
+    return JSONResponse(status_code=code if 400 <= code <= 599 else 500,
+                        content={"code": code, "msg": msg, "data": None})
 
 
 def _deny(action: str, target: str) -> dict:
