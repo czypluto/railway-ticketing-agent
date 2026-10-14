@@ -1,6 +1,23 @@
 #!/usr/bin/env bash
 # 停止全部服务：前端/Java(Windows) + WSL Python/嵌入；保留 Redis/MySQL 容器。
 # 用法：bash scripts/stop-all.sh
+# 环境守卫：cmd 里的 `bash` 常解析到 WSL 而非 Git Bash；非 MSYS bash 下误跑会静默失败，此处自动转交 Git Bash。
+case "$(uname -s 2>/dev/null)" in
+  MINGW*|MSYS*) ;;  # 已在 Git Bash
+  *)
+    _gb=""
+    for _g in "/mnt/c/Program Files/Git/bin/bash.exe" "/mnt/c/Program Files/Git/usr/bin/bash.exe"; do
+      [ -x "$_g" ] && { _gb="$_g"; break; }
+    done
+    if [ -n "$_gb" ]; then
+      _abs=$(readlink -f "$0" 2>/dev/null || echo "$0")
+      _scr=$(wslpath -w "$_abs" 2>/dev/null || echo "$_abs")
+      exec "$_gb" "$_scr"
+    fi
+    echo "[stop-all] 未找到 Git Bash，请直接打开 Git Bash 后运行本脚本。"
+    exit 1
+    ;;
+esac
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 
