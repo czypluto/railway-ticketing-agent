@@ -234,6 +234,10 @@ class AgentService:
             acted = False
             for tc in out.tool_calls:
                 name, args = tc.name, tc.arg_dict()
+                # 工具调用也作为事件推出去：前端可显示进度，行为评测靠它断言
+                # 「该调的调了、不该调的没调」。只带工具名，不带参数（参数可能含隐私）。
+                # 前端与归档只认已知 kind，新增 kind 对它们无影响。
+                yield _event("tool", name)
                 try:
                     if name == "query_tickets":
                         rows = await java_client.query_tickets(

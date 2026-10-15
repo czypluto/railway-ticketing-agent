@@ -30,6 +30,24 @@ python scripts/chat_e2e.py zhanggong "帮我查明天北京南到上海虹桥的
 bash scripts/reset-demo.sh
 ```
 
+## Agent 行为层评测
+
+| 脚本 | 作用 |
+|---|---|
+| `agent_eval/run.py` | 断言 Agent **行为**：工具轨迹、是否出票、是否拒绝（18 用例 / 6 类） |
+| `agent_eval/cases.jsonl` | 用例集，加一行即可扩用例 |
+
+和 `rag_eval/` 的分工：那边测检索**质量**（Hit@K / MRR / RAGAS），
+这边测 Agent **行为**。「有没有乱下单」这类断言不能靠文案判断——
+`order_delta` 直接数**数据库里的订单数**。
+
+```bash
+python scripts/agent_eval/run.py                 # 需 AGENT_CONFIRM_LEGACY=0
+python scripts/agent_eval/run.py --cat F --repeat 3
+```
+
+结论、变异测试与尚未覆盖的部分见 `agent_eval/README.md`。
+
 ## 容量测试
 
 | 脚本 | 作用 |
