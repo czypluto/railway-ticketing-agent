@@ -55,3 +55,8 @@ app:
 logging:
   level:
     com.group.resv: info
+  pattern:
+    # 带上 traceId（由 TraceIdFilter 从 X-Trace-Id 写入 MDC）。
+    # 一次下单横跨 Python 与 Java，出问题时把同一个 id 拿去两边 grep 就能拼出完整链路；
+    # `:-` 是缺省值——没经过 filter 的日志（启动期、健康检查）显示为空，不影响阅读。
+    console: "%d{HH:mm:ss.SSS} %5p [%X{traceId:-}] [%15.15t] %-36.36logger{36} : %m%n"

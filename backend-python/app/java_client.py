@@ -15,7 +15,7 @@ from urllib.parse import urlencode
 
 import httpx
 
-from . import config
+from . import config, trace
 from .middleware import raw_token
 
 logger = logging.getLogger(__name__)
@@ -87,6 +87,11 @@ async def _call_once(method: str, url: str, headers: dict, body: Optional[dict])
 async def _call(method: str, path: str, body: Optional[dict] = None) -> Any:
     url = f"{config.JAVA_BASE}{path}"
     headers = {"Authorization": f"Bearer {raw_token()}"}
+    # 透传 trace id：Java 侧 TraceIdFilter 会把它放进 MDC，
+    # 于是同一次对话在两边的日志都能按同一个 id grep 出来。
+    tid = trace.current()
+    if tid:
+        headers[trace.HEADER] = tid
 
     last: Optional[BaseException] = None
     for attempt in range(1, MAX_ATTEMPTS + 1):

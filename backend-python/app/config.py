@@ -55,6 +55,7 @@ EMBED_MAX_LEN = int(os.getenv("EMBEDDING_MAX_LEN", "2048"))
 RAG_DB = ROOT / "data" / "rag.db"
 DOCS_DIR = ROOT / "data" / "docs"
 AUDIT_FILE = ROOT / "data" / "audit" / "kb.jsonl"  # 知识库管理操作审计（含被拒的越权尝试）
+USAGE_FILE = ROOT / "data" / "usage" / "llm.jsonl"  # 模型用量记账（供 scripts/cost_report.py 聚合）
 
 
 def resolve_model(task: str) -> str:

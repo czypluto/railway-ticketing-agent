@@ -34,6 +34,7 @@ milvus_data/
 mysql_data/
 backend-python/data/rag.db
 backend-python/data/audit/
+backend-python/data/usage/
 
 # 评测运行产物（评测集与脚本入库，结果不入库）
 scripts/rag_eval/result*.json

@@ -69,8 +69,11 @@ def reset(username: str) -> None:
            f"join sys_user u on o.user_id=u.id where u.username='{username}';")
     for pattern in ("resv:agent:*", "rv:active:*", "rv:inflight:*",
                     "rv:stock:*", "rv:seat:*"):
+        # 必须显式 utf-8：席别是中文，key 形如 rv:stock:38:二等座，
+        # Windows 默认按 GBK 解码会抛 UnicodeDecodeError，stdout 变 None。
         keys = subprocess.run(["docker", "exec", "resv-redis", "redis-cli", "KEYS", pattern],
-                              capture_output=True, text=True).stdout.split()
+                              capture_output=True, text=True,
+                              encoding="utf-8", errors="replace").stdout.split()
         if keys:
             subprocess.run(["docker", "exec", "resv-redis", "redis-cli", "DEL", *keys],
                            capture_output=True)

@@ -1,12 +1,14 @@
 """对话入口：POST /api/chat，以 SSE 流式返回编排事件。"""
 import json
 import logging
+import time
 from typing import Optional
 
 from fastapi import APIRouter
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
+from .. import trace
 from ..agent import history as hist
 from ..agent import memory as mem
 from ..agent.orchestrator import AgentService
@@ -29,11 +31,19 @@ class ChatBody(BaseModel):
 
 async def _stream(body: ChatBody):
     """逐步推送：思考中 -> 检索/校验 -> 执行 -> 结果。每条事件带当前 model。"""
+    # 每轮对话一个 trace id：沿 X-Trace-Id 透传给 Java，两边日志可串成一条链路。
+    # 出错时也会带在提示里，用户报障时能直接给出这个 id。
+    tid = trace.new_trace_id()
+    trace.set_trace_id(tid)
+    t0 = time.perf_counter()
+
     if not body.message.strip() and not body.resume:
         payload = {"kind": "error", "text": "请求为空：需要 message 或 resume 之一。", "model": ""}
         yield f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
         yield "data: [DONE]\n\n"
         return
+
+    logger.info("对话开始 trace=%s resume=%s", tid, bool(body.resume))
 
     # 归档用的用户侧文案：点按钮那一轮没有自然语言输入，补一个可读的占位
     user_note = body.message.strip() or (
@@ -56,10 +66,12 @@ async def _stream(body: ChatBody):
         ev = {"kind": "error", "text": str(e), "model": ""}
         yield f"data: {json.dumps(ev, ensure_ascii=False)}\n\n"
     except Exception as e:  # noqa: BLE001
-        logger.exception("编排异常")
-        ev = {"kind": "error", "text": f"处理出错：{e}", "model": ""}
+        logger.exception("编排异常 trace=%s", tid)
+        ev = {"kind": "error", "text": f"处理出错：{e}（trace {tid}）", "model": ""}
         yield f"data: {json.dumps(ev, ensure_ascii=False)}\n\n"
     finally:
+        logger.info("对话结束 trace=%s 耗时=%dms 事件=%d",
+                    tid, int((time.perf_counter() - t0) * 1000), len(lines))
         if uid:
             try:
                 # 1) 全量对话档案（可回溯）

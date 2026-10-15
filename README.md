@@ -35,6 +35,16 @@ JWT 校验 → 每轮 RAG 检索注入参考资料 → function-calling Agent �
 挂起状态（待确认意向 / 待支付订单 / 最近查票结果）存在 Redis（`app/agent/pending.py`），
 不再放进程内存——多副本部署不会串号，重启不丢。Redis 已开 AOF。
 
+## 可观测性
+
+**trace id 跨服务**：Python 每轮对话生成一个 `trace_id`，随 `X-Trace-Id` 头透传给 Java，
+两边日志都带上。一次下单横跨编排层与交易层，出问题时把同一个 id 拿去两边 grep
+就能拼出完整链路（此前只能靠时间戳猜）。出错提示里也会带上它，便于报障。
+
+**模型用量**：`app/llm.py` 每次调用自动记 token 到 `data/usage/llm.jsonl`，
+`scripts/cost_report.py` 聚合成「一次对话花多少 / 钱花在哪」。
+实测输入占约 90%——成本在上下文注入而非生成。
+
 ## 环境要求
 
 - Windows + WSL2（`C:\Users\<user>\.wslconfig` 给 12GB 内存）
@@ -60,4 +70,7 @@ JWT 校验 → 每轮 RAG 检索注入参考资料 → function-calling Agent �
   `array('i')`（10 万页 2.3 GB → 0.33 GB，约 1/7；查询只扫命中页）。
   **语料再大需要改增量维护，或把倒排挪到独立检索组件。**
 - RAG 知识库为演示规模（22 篇）；检索评测集 36 条在 `scripts/rag_eval/`。
-- 模型用量（token）未做统计与成本计量。
+- **Java 只读接口不做日志**（查票/订单查询），所以这些请求虽然在 Java 侧收到了
+  trace id，却没有日志行可关联——只有写操作（下单/支付/退票）可跨服务追踪。
+- 模型用量的**单价未配置**（`scripts/cost_report.py` 只报 token，不报金额）；
+  单价以服务商价格页为准，用 `MODEL_PRICE_<模型名>` 环境变量配。

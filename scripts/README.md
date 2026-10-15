@@ -30,6 +30,24 @@ python scripts/chat_e2e.py zhanggong "帮我查明天北京南到上海虹桥的
 bash scripts/reset-demo.sh
 ```
 
+## 模型用量与成本
+
+| 脚本 | 作用 |
+|---|---|
+| `cost_report.py` | 聚合模型用量：token、按任务拆分、最贵的 N 次对话 |
+
+账本在 `backend-python/data/usage/llm.jsonl`（由 `app/llm.py` 每次调用自动记，
+不入库），**只存 token 不存金额**——单价变了历史数据还能重新定价。
+单价默认不配，用 `MODEL_PRICE_<模型名>=输入价/输出价` 环境变量给。
+
+```bash
+python scripts/cost_report.py --by-task --top 5
+MODEL_PRICE_DEEPSEEK_V4_PRO=2.0/8.0 python scripts/cost_report.py
+```
+
+实测：**输入 token 占约 90%** ——成本主要在上下文注入（system + 车站表 + 参考资料 +
+记忆 + 工具结果），不在生成。所以降成本该先削上下文，不是换更小的模型。
+
 ## 依赖故障演练
 
 | 脚本 | 作用 |
