@@ -6,8 +6,10 @@
   下单   /api/ticket/buy
   我的订单/支付/退票  /api/ticket/orders/**
 """
+import asyncio
 import json
 import logging
+import os
 from typing import Any, Optional
 from urllib.parse import urlencode
 
@@ -20,12 +22,20 @@ logger = logging.getLogger(__name__)
 
 _client: Optional[httpx.AsyncClient] = None
 
+# 分项超时，而不是原来一个笼统的 timeout=20：
+#   connect 3s —— Java 在同网/本机，连不上就是真挂了，早失败早降级
+#   read  15s —— 留足 Java 侧事务（扣库存、落库）的时间
+_TIMEOUT = httpx.Timeout(connect=3.0, read=15.0, write=15.0, pool=3.0)
+
+MAX_ATTEMPTS = int(os.getenv("JAVA_MAX_ATTEMPTS", "3"))
+_BACKOFF_BASE = 0.2          # 0.2s → 0.4s
+
 
 def _get_client() -> httpx.AsyncClient:
     """连接复用：进程内共享一个 AsyncClient，避免每请求新建。"""
     global _client
     if _client is None:
-        _client = httpx.AsyncClient(timeout=20)
+        _client = httpx.AsyncClient(timeout=_TIMEOUT)
     return _client
 
 
@@ -36,10 +46,34 @@ class JavaError(Exception):
         self.msg = msg  # 供编排层 e.msg 取业务提示；str(e) 同样返回该消息
 
 
-async def _call(method: str, path: str, body: Optional[dict] = None) -> Any:
-    url = f"{config.JAVA_BASE}{path}"
-    headers = {"Authorization": f"Bearer {raw_token()}"}
+class JavaTransient(Exception):
+    """暂时性故障（5xx）。与业务错误 JavaError 分开，因为处置方式不同。"""
+
+    def __init__(self, msg: str):
+        super().__init__(msg)
+        self.msg = msg
+
+
+def _can_retry(exc: BaseException, method: str) -> bool:
+    """判断这次失败能不能**安全**重放。
+
+    GET 幂等，随便重放。
+    POST 只在「请求确定没到达服务端」时重试 —— 也就是连接建立失败。
+    读超时 / 写超时意味着服务端可能已经处理了，重发会有重复下单、重复支付的风险。
+    Java 侧虽然有幂等控制，但不该把正确性押在它身上。
+    """
+    if isinstance(exc, (httpx.ConnectError, httpx.ConnectTimeout)):
+        return True
+    if isinstance(exc, JavaTransient):
+        return method.upper() == "GET"
+    return False
+
+
+async def _call_once(method: str, url: str, headers: dict, body: Optional[dict]) -> Any:
+    # 网络类异常原样上抛，好让 _can_retry 能按具体类型判断
     resp = await _get_client().request(method, url, json=body, headers=headers)
+    if resp.status_code >= 500:
+        raise JavaTransient(f"Java 返回 {resp.status_code}")
     try:
         payload = resp.json()
     except json.JSONDecodeError:
@@ -48,6 +82,31 @@ async def _call(method: str, path: str, body: Optional[dict] = None) -> Any:
     if code != 0:
         raise JavaError(code, payload.get("msg", "服务处理失败"))
     return payload.get("data")
+
+
+async def _call(method: str, path: str, body: Optional[dict] = None) -> Any:
+    url = f"{config.JAVA_BASE}{path}"
+    headers = {"Authorization": f"Bearer {raw_token()}"}
+
+    last: Optional[BaseException] = None
+    for attempt in range(1, MAX_ATTEMPTS + 1):
+        try:
+            return await _call_once(method, url, headers, body)
+        except JavaError:
+            raise                                    # 业务错误：重试没有意义
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:                       # noqa: BLE001
+            last = e
+            if attempt >= MAX_ATTEMPTS or not _can_retry(e, method):
+                break
+            delay = _BACKOFF_BASE * (2 ** (attempt - 1))
+            logger.warning("Java 调用失败（第 %d/%d 次）%s %s：%s —— %.1fs 后重试",
+                           attempt, MAX_ATTEMPTS, method, path, e, delay)
+            await asyncio.sleep(delay)
+
+    msg = getattr(last, "msg", None) or f"Java 服务不可用（{type(last).__name__}）"
+    raise JavaError(503, msg)
 
 
 async def stations(kw: Optional[str] = None) -> list[dict]:

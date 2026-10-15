@@ -5,7 +5,9 @@
 
 改数据的动作不交给模型：buy_ticket 的 tripId 必须来自上一轮查票结果，下单走两阶段确认。
 """
+import asyncio
 import logging
+import os
 import uuid
 from datetime import date
 from typing import AsyncIterator, Optional
@@ -16,13 +18,69 @@ from ..middleware import current_user
 from ..rag.store import RagStore, get_store, rag_available
 from . import history as hist
 from . import memory as mem
+from . import pending
 
 logger = logging.getLogger(__name__)
 
 # 动作词：命中则视为"办业务"而非"问规则"，避免规则词把下单请求吞进 RAG
 ACTION_WORDS = ("买", "订", "购", "预约", "帮我查", "下单")
 
-CONFIRM_WORDS = ("确认", "是的", "可以", "好的", "就买", "下单", "买吧")
+# ── 确认判定 ──────────────────────────────────────────────────────────
+# 现在的主路径是**结构化**的：挂起时把 intent_id 下发给前端，前端在用户点
+# 「确认」时原样带回，后端比对通过才执行。这样「确认」这个动作离开了自然语言，
+# 不会再出现「好的，但我想改时间」被当成确认的情况。
+#
+# 下面这组关键词只服务于**过渡期**：前端还没改造时，退回到原来靠词猜的行为，
+# 保证不破坏现有前端。每次命中都会打 warning。
+# ⚠️ 前端改造上线后，把环境变量 AGENT_CONFIRM_LEGACY 置 0，缺陷才算真正消除。
+LEGACY_CONFIRM_WORDS = ("确认", "是的", "可以", "好的", "就买", "下单", "买吧")
+LEGACY_PAY_WORDS = ("支付", "付款", "付钱")
+
+
+def _legacy_confirm_enabled() -> bool:
+    return os.getenv("AGENT_CONFIRM_LEGACY", "1") == "1"
+
+
+def _intent_decision(intent: dict, user_text: str, resume: Optional[dict]) -> bool:
+    """判定「是否确认下单」。
+
+    结构化优先；前端未回传 intent_id 时才考虑过渡期的关键词回退。
+    """
+    if resume is not None:
+        # 没有 intent_id 的载荷不是针对「下单」的（例如支付载荷）—— 不处理
+        if "intent_id" not in resume:
+            return False
+        matched = resume.get("intent_id") == intent.get("intent_id")
+        if not matched:
+            logger.warning("确认载荷 intent_id 不匹配，已拒绝（串话或重放）")
+        return bool(resume.get("confirm")) and matched
+
+    if _legacy_confirm_enabled():
+        hit = any(w in user_text for w in LEGACY_CONFIRM_WORDS)
+        if hit:
+            logger.warning("下单确认走了关键词回退（AGENT_CONFIRM_LEGACY=1）——"
+                           "前端改造上线后请把该开关置 0")
+        return hit
+    return False
+
+
+def _pay_decision(user_text: str, resume: Optional[dict]) -> bool:
+    """判定「是否确认支付」。
+
+    ⚠️ 必须要求载荷**显式声明** action=pay。
+    曾经的写法是「只要 resume 里 confirm 为真就付」，结果任何带 confirm 的载荷
+    —— 包括一个过期的下单确认 —— 都会顺带把待支付订单付掉。
+    付款是不可逆动作，不能靠载荷里恰好有个 confirm 字段来触发。
+    """
+    if resume is not None:
+        if resume.get("action") != "pay":
+            logger.warning("收到非支付用途的确认载荷，已忽略支付路径：%s", resume)
+            return False
+        return bool(resume.get("confirm"))
+
+    if _legacy_confirm_enabled():
+        return any(w in user_text for w in LEGACY_PAY_WORDS)
+    return False
 
 
 def _event(kind: str, text: str, task: str = "agent") -> dict:
@@ -40,6 +98,15 @@ def _find_trip(rows, trip_id):
     return next((r for r in rows if r.get("tripId") == trip_id), None)
 
 
+async def _safe_stations() -> list[dict]:
+    """取车站列表；失败不阻断这一轮 —— 车站只是给模型的提示，不是必需项。"""
+    try:
+        return await java_client.stations()
+    except Exception:  # noqa: BLE001
+        logger.exception("车站服务不可用")
+        return []
+
+
 def _system_prompt() -> str:
     return (
         "你是铁路购票助手。今天是%s。\n"
@@ -55,64 +122,82 @@ def _system_prompt() -> str:
 class AgentService:
     def __init__(self) -> None:
         self._rag: Optional[RagStore] = None
-        # 最近一次查票结果（按用户），用于约束 buy_ticket 的 tripId 必须来自查询
-        self._rows: dict[int, list] = {}
-        # 待确认的下单意向（按用户）：模型反向复述后，用户确认才真正下单
-        self._intents: dict[int, dict] = {}
-        # 刚下单的待支付订单 requestId（按用户），便于用户回“支付”完成付款
-        self._orders: dict[int, str] = {}
+        # 挂起状态（最近查票结果 / 待确认意向 / 待支付订单）已挪出进程内存，
+        # 落到 Redis —— 见 app/agent/pending.py。
+        # 原来这里有三个按 user_id 索引的 dict，多副本部署会串号、重启会丢。
 
     def _rag_store(self) -> Optional[RagStore]:
         if self._rag is None:
             self._rag = get_store() if rag_available() else None
         return self._rag
 
-    async def handle(self, user_text: str) -> AsyncIterator[dict]:
+    async def _retrieve_refs(self, user_text: str, user) -> list[str]:
+        """每轮检索参考资料注入上下文；失败只降级不报错。
+
+        抽出来是为了能和取车站并行跑（见 handle）。
+        """
+        rag = self._rag_store()
+        if not rag or not rag.enabled:
+            return []
+        try:
+            return await rag.retrieve(user_text, department=user.department, top_k=4)
+        except Exception as e:  # noqa: BLE001
+            logger.warning("RAG 检索失败，跳过参考注入：%s", e)
+            return []
+
+    async def handle(self, user_text: str,
+                     resume: Optional[dict] = None) -> AsyncIterator[dict]:
+        """跑一轮对话。
+
+        resume: 前端在用户点「确认 / 取消」时回传的结构化载荷，
+                形如 {"confirm": True, "intent_id": "a1b2c3d4e5f6"}。
+                普通文本输入时为 None —— 此时不再靠关键词猜意图（过渡期除外）。
+        """
         user = current_user()
+        uid = user.user_id
         yield _event("think", f"已收到请求，正在为您办理（{user.identity}）。")
 
-        try:
-            stations = await java_client.stations()
-        except Exception as e:  # noqa: BLE001
-            logger.exception("车站服务不可用")
-            stations = []
-        station_line = "、".join(s["name"] for s in stations[:30])
-
-        # 两段式确认：上一轮已"反向复述待确认"的意向/待支付订单，本轮回“确认/支付”即执行
-        pay_rid = self._orders.get(user.user_id)
-        if pay_rid and any(w in user_text for w in ("支付", "付款", "付钱")):
-            self._orders.pop(user.user_id, None)
+        # ── 两段式确认：先判，命中就返回 ──
+        # 放在取车站 / RAG 之前：确认路径用不到这两样，挪前面省掉一轮无用 IO。
+        pay_rid = pending.get(uid, "order")
+        if pay_rid and _pay_decision(user_text, resume):
+            pending.drop(uid, "order")
             try:
                 r = await java_client.pay(pay_rid)
                 yield _event("result", f"订单 {pay_rid} 已支付，状态 {r.get('status')}。")
             except java_client.JavaError as e:
                 yield _event("error", e.msg)
             return
-        intent = self._intents.get(user.user_id)
-        if intent and any(w in user_text for w in CONFIRM_WORDS):
-            # 用户确认：执行预填的下单
-            self._intents.pop(user.user_id, None)
+
+        intent = pending.get(uid, "intent")
+        if intent and _intent_decision(intent, user_text, resume):
+            # 用户确认：执行预填的下单（确定性路径，不再让模型介入）
+            pending.drop(uid, "intent")
             async for ev in self._commit_buy(user, intent):
                 yield ev
             return
         if intent:
-            # 用户改了主意/新请求：作废旧意向，落到下面按新请求处理
-            self._intents.pop(user.user_id, None)
+            # 用户改了主意 / 提了新请求：作废旧意向，落到下面按新请求处理
+            pending.drop(uid, "intent")
+
+        if resume is not None and not user_text.strip():
+            # 结构化载荷没匹配上任何待办（多半是过期或串话过来的）。
+            # 此时没有自然语言输入，不必再拿空消息去调模型白花一次调用。
+            yield _event("answer", "该操作已失效或与当前待办不符，请重新发起。")
+            return
+
+        # 车站列表与 RAG 检索互不依赖 —— 并行取，省一个往返。
+        stations, refs = await asyncio.gather(
+            _safe_stations(),
+            self._retrieve_refs(user_text, user),
+        )
+        station_line = "、".join(s["name"] for s in stations[:30])
+        ref_block = ("【参考资料】\n" + "\n---\n".join(r.strip() for r in refs if r and r.strip())
+                     if refs else "【参考资料】（未检索到相关资料）")
 
         # 记忆按会话隔离：上下文取自“当前会话”，切会话即切上下文
-        session = hist.current_session(user.user_id)
-        state = mem.load_state(user.user_id, session=session)
-
-        # 每轮先做一次 RAG 检索：把相关规则/知识作为参考资料注入，模型先看资料再决定要不要调 Java 工具
-        refs: list[str] = []
-        rag = self._rag_store()
-        if rag and rag.enabled:
-            try:
-                refs = await rag.retrieve(user_text, department=user.department, top_k=4)
-            except Exception as e:  # noqa: BLE001
-                logger.warning("RAG 检索失败，跳过参考注入：%s", e)
-        ref_block = "【参考资料】\n" + "\n---\n".join(r.strip() for r in refs if r and r.strip()) \
-            if refs else "【参考资料】（未检索到相关资料）"
+        session = hist.current_session(uid)
+        state = mem.load_state(uid, session=session)
 
         sys_content = _system_prompt()
         if state["summary"]:
@@ -155,7 +240,7 @@ class AgentService:
                             args.get("from", ""), args.get("to", ""),
                             args.get("date", date.today().isoformat()),
                             args.get("seatClass"))
-                        self._rows[user.user_id] = rows
+                        pending.set(uid, "rows", rows)
                         shown = True
                         acted = True
                         text = self._query_text(rows)
@@ -163,11 +248,14 @@ class AgentService:
                         yield _event("result", text)
                     elif name == "buy_ticket":
                         # 防臆造 + 反向复述：tripId 必须来自查票结果，且下单前请用户确认
-                        row = _find_trip(self._rows.get(user.user_id, []), args.get("tripId"))
+                        row = _find_trip(pending.get(uid, "rows") or [], args.get("tripId"))
                         if row is None:
                             yield _event("error", "请先使用 query_tickets 查询车次，再从结果中选择要购买的车次。")
                             return
                         intent = {
+                            # 结构化确认用的标识：下发给前端，用户点「确认」时原样带回，
+                            # 后端比对通过才执行 —— 不再靠从「好的」这类词里猜意图。
+                            "intent_id": pending.new_intent_id(),
                             "tripId": row["tripId"],
                             "seatClass": row["seatClass"],
                             "from": row["from"],
@@ -177,12 +265,12 @@ class AgentService:
                             "ticketType": (args.get("ticketType") or "ADULT").upper(),
                             "contactId": args.get("contactId"),
                         }
-                        self._intents[user.user_id] = intent
+                        pending.set(uid, "intent", intent)
                         shown = True
                         acted = True
                         base = (f"请确认下单：{intent['trainCode']} {intent['date']} "
                                 f"{intent['from']}→{intent['to']} {intent['seatClass']} "
-                                f"({intent['ticketType']}) 回复“确认”即出票。")
+                                f"({intent['ticketType']})。请在下方确认或取消。")
                         if intent["ticketType"] in ("CHILD", "STUDENT"):
                             rule = await self._rule_snippet(
                                 "儿童票" if intent["ticketType"] == "CHILD" else "学生票")
@@ -190,7 +278,9 @@ class AgentService:
                                 base = f"下单前请核对规则：{rule[:180]}\n{base}"
                         confirm = base
                         msgs.append({"role": "assistant", "content": confirm})
-                        yield _event("confirm", confirm)
+                        # intent_id 随事件下发：前端保存它，用户点「确认」时原样带回。
+                        yield {**_event("confirm", confirm),
+                               "intent_id": intent["intent_id"]}
                         return
                     elif name == "my_orders":
                         rows = await java_client.my_orders()
@@ -278,11 +368,13 @@ class AgentService:
             return
         rid = r.get("requestId")
         if rid:
-            self._orders[user.user_id] = rid
+            pending.set(user.user_id, "order", rid)
         line = (f"下单成功：{r.get('from')}->{r.get('to')} {r.get('seatClass')}，"
                 f"金额 {r.get('priceCents')}分，状态 {r.get('status')}，订单号 {r.get('orderNo')}。"
-                f"回复“支付”完成付款。")
-        yield _event("result", line)
+                f"请在下方完成支付。")
+        # 带上 requestId：前端据此渲染「支付」按钮，不必让用户打字。
+        # 这也让支付脱离了关键词路径 —— 关掉 AGENT_CONFIRM_LEGACY 后仍可支付。
+        yield {**_event("result", line), "pay_request_id": rid}
 
     async def _rule_snippet(self, keyword: str) -> str:
         """RAG 取一条规则摘要，供下单确认前置（A 层：信息前置）。"""

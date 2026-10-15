@@ -4,6 +4,7 @@
 - 超出即触发一次“上下文压缩”：把被淘汰的更早轮次用 LLM 压进一条摘要并滚动继承；
   LLM 不可用时退回朴素拼接截断，绝不因此抛错。
 - 存储：Redis（MEMORY_REDIS_HOST）优先，连不上退回进程内存。
+- append 是**协程**（压缩要调 LLM）；load_state / clear 是同步的。
 """
 import json
 import logging
@@ -87,14 +88,20 @@ def _clean(raw):
     return out
 
 
-def _compress(summary_old: str, evicted: list[dict]) -> str:
-    """把更早轮次压进摘要。优先 LLM，失败退朴素拼接。"""
+async def _compress(summary_old: str, evicted: list[dict]) -> str:
+    """把更早轮次压进摘要。优先 LLM，失败退朴素拼接。
+
+    注意 llm.chat 是协程 —— 这里必须 await。曾经漏了 await，
+    拿到的是 coroutine 对象，取 .content 直接 AttributeError，
+    被 except 吞掉后退回朴素拼接：**LLM 摘要从未真正生效过**，
+    日志里只留一条 warning，很容易被当成噪音忽略。
+    """
     turns = "\n".join(f"{m.get('role')}: {m.get('content')}" for m in evicted)
     try:
         from .. import llm
 
         base = f"这是已有的对话摘要：\n{summary_old}\n" if summary_old else ""
-        out = llm.chat(
+        out = await llm.chat(
             task="gen",
             messages=[
                 {"role": "system",
@@ -105,17 +112,20 @@ def _compress(summary_old: str, evicted: list[dict]) -> str:
             temperature=0.0,
         )
         if out and out.content and out.content.strip():
-            return out.content.strip()[:_SUMMARY_MAX]
+            return out.content.strip()[:SUMMARY_MAX]
     except Exception as e:  # noqa: BLE001
         logger.warning("摘要压缩失败，退朴素拼接：%s", e)
     # 朴素回退：只取被淘汰轮次里的用户话，截到上限
     user_only = "；".join(m.get("content", "") for m in evicted if m.get("role") == "user")
     merged = ((summary_old + " " + user_only) if summary_old else user_only).strip()
-    return merged[:_SUMMARY_MAX]
+    return merged[:SUMMARY_MAX]
 
 
-def append(user_id, user_text, reply, session=""):
-    """记一轮 (user, assistant) 到指定会话；超窗触发上下文压缩并保留近期原文。"""
+async def append(user_id, user_text, reply, session=""):
+    """记一轮 (user, assistant) 到指定会话；超窗触发上下文压缩并保留近期原文。
+
+    协程 —— 压缩要走 LLM，调用方需 await。
+    """
     if not user_text or not reply:
         return
     st = _read(user_id, session)
@@ -128,7 +138,7 @@ def append(user_id, user_text, reply, session=""):
     summary = st.get("summary", "")
     if len(msgs) > RAW_LIMIT:
         evicted, keep = msgs[:-RAW_LIMIT], msgs[-RAW_LIMIT:]
-        summary = _compress(summary, evicted)
+        summary = await _compress(summary, evicted)
         msgs = keep
 
     _write(user_id, session, {"summary": summary, "msgs": msgs})
