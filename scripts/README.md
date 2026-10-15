@@ -30,6 +30,21 @@ python scripts/chat_e2e.py zhanggong "帮我查明天北京南到上海虹桥的
 bash scripts/reset-demo.sh
 ```
 
+## 容量测试
+
+| 脚本 | 作用 |
+|---|---|
+| `capacity/bench.py` | RAG 页索引的构建内存/耗时 + 查询延迟；`--impl old` 可对比重构前 |
+| `capacity/candidate_ratio.py` | 倒排候选集占比——解释查询提速为何因查询而异 |
+
+`build_page_index` 是纯函数，所以**不需要 Milvus、不需要停主服务**，
+用 backend-python 的 venv 直接跑即可。结论与 caveat 见 `capacity/README.md`。
+
+```bash
+python scripts/capacity/bench.py --pages 100000 --impl new
+python scripts/capacity/bench.py --pages 100000 --impl old
+```
+
 ## 手动启动步骤（对应 `docs/架构设计.md` §9）
 
 1. WSL2 就绪（`.wslconfig` 12GB，`wsl --shutdown` 后重启）
