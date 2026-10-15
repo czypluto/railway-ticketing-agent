@@ -66,8 +66,13 @@ export async function login(username, password) {
 /**
  * Python 对话（SSE）。逐条回调 onEvent({kind,text,model})；结束回调 onDone()。
  * 返回 abort 函数。
+ *
+ * resume：用户点「确认 / 取消」按钮时回传的结构化载荷，
+ *         形如 { confirm: true, intent_id: 'a1b2c3d4e5f6' }；此时 message 传空串即可。
+ *         走这条路径时后端不做自然语言解析，因此不会再出现
+ *         「好的，但我想改时间」被误判为确认下单的情况。
  */
-export function chatStream(message, token, onEvent, onDone) {
+export function chatStream(message, token, onEvent, onDone, resume = null) {
   const controller = new AbortController()
 
   fetch('/py-api/api/chat', {
@@ -76,7 +81,7 @@ export function chatStream(message, token, onEvent, onDone) {
       'Content-Type': 'application/json',
       Authorization: `Bearer ${token}`
     },
-    body: JSON.stringify({ message }),
+    body: JSON.stringify(resume ? { message: message || '', resume } : { message }),
     signal: controller.signal
   })
     .then(async (resp) => {

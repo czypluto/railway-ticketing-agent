@@ -202,14 +202,15 @@ function scrollBottom() {
   })
 }
 
-function stream(message, token, onEvent, onDone) {
+function stream(message, token, onEvent, onDone, resume = null) {
   const controller = new AbortController()
   ;(async () => {
     try {
       const resp = await fetch(props.endpoint, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
-        body: JSON.stringify({ message }),
+        // resume 为结构化确认载荷（{confirm, intent_id}），此时 message 为空串
+        body: JSON.stringify(resume ? { message: message || '', resume } : { message }),
         signal: controller.signal
       })
       if (!resp.ok) {
@@ -251,24 +252,10 @@ function onKeydown(e) {
   }
 }
 
-async function send(raw) {
-  const content = (raw ?? text.value).trim()
-  if (!content || sending.value) return
-  text.value = ''
-  const token = localStorage.getItem(props.tokenKey) || ''
-  if (!token) {
-    messages.push({ role: 'assistant', text: '尚未登录。请先登录后再与购票助手对话。', stage: '', tone: 'error', model: '' })
-    scrollBottom()
-    return
-  }
-  messages.push({ role: 'user', text: content })
-  const cur = reactive({ role: 'assistant', text: '', stage: '正在处理…', tone: 'normal', model: '' })
-  messages.push(cur)
-  sending.value = true
-  scrollBottom()
-
-  // 后端实际推送的事件类型：think / result / answer / confirm / error
-  const onEvent = (ev) => {
+// 事件与收尾处理抽出来，供「发消息」和「确认/取消按钮」两条路径共用。
+// 后端实际推送的事件类型：think / result / answer / confirm / error
+function makeOnEvent(cur) {
+  return (ev) => {
     if (ev.kind === 'think') {
       cur.stage = '正在为您办理…'
     } else if (ev.kind === 'error') {
@@ -279,11 +266,19 @@ async function send(raw) {
       cur.stage = ''
       cur.text = cur.text ? `${cur.text}\n${ev.text}` : ev.text
       cur.tone = ev.kind === 'confirm' ? 'confirm' : ev.kind === 'result' ? 'success' : 'normal'
+      // 后端随 confirm 事件下发 intent_id。存到这条消息上，
+      // 由下面的「确认下单 / 取消」按钮原样回传 —— 用户不再需要打字「确认」。
+      if (ev.kind === 'confirm' && ev.intent_id) cur.intentId = ev.intent_id
+      // 下单成功后后端带回 requestId，据此渲染「支付」按钮（同样不打字）
+      if (ev.pay_request_id) cur.payRequestId = ev.pay_request_id
     }
     if (ev.model) cur.model = ev.model
     scrollBottom()
   }
-  const onDone = () => {
+}
+
+function makeOnDone(cur) {
+  return () => {
     sending.value = false
     if (stopped) {
       // 主动停止不是失败：此前会被判成“服务未返回结果”弹红色报错
@@ -296,7 +291,69 @@ async function send(raw) {
     }
     scrollBottom()
   }
-  abortFn = stream(content, token, onEvent, onDone)
+}
+
+function pushAssistant(stage = '正在处理…') {
+  const cur = reactive({
+    role: 'assistant', text: '', stage, tone: 'normal', model: '', intentId: '', payRequestId: ''
+  })
+  messages.push(cur)
+  return cur
+}
+
+/** 点「支付」：走显式的 action=pay 载荷，同样不经过自然语言。 */
+async function payOrder(msg) {
+  if (sending.value) return
+  const rid = msg.payRequestId
+  if (!rid) return
+  msg.payRequestId = ''                   // 用掉即清，防止重复支付
+  const token = localStorage.getItem(props.tokenKey) || ''
+  if (!token) return
+
+  messages.push({ role: 'user', text: '［支付］' })
+  const cur = pushAssistant()
+  sending.value = true
+  scrollBottom()
+  abortFn = stream('', token, makeOnEvent(cur), makeOnDone(cur),
+                   { action: 'pay', confirm: true })
+}
+
+/**
+ * 点「确认下单 / 取消」。
+ * 关键：带上 intent_id 走结构化确认路径，完全不经过自然语言 ——
+ * 这也意味着「好的，但我想改时间」这类句子不会再触发出票。
+ */
+async function decideBuy(msg, confirm) {
+  if (sending.value) return
+  const intentId = msg.intentId
+  if (!intentId) return
+  msg.intentId = ''                       // 用掉即清，防止重复点击重复提交
+  const token = localStorage.getItem(props.tokenKey) || ''
+  if (!token) return
+
+  messages.push({ role: 'user', text: confirm ? '［确认下单］' : '［取消下单］' })
+  const cur = pushAssistant()
+  sending.value = true
+  scrollBottom()
+  abortFn = stream('', token, makeOnEvent(cur), makeOnDone(cur),
+                   { confirm, intent_id: intentId })
+}
+
+async function send(raw) {
+  const content = (raw ?? text.value).trim()
+  if (!content || sending.value) return
+  text.value = ''
+  const token = localStorage.getItem(props.tokenKey) || ''
+  if (!token) {
+    messages.push({ role: 'assistant', text: '尚未登录。请先登录后再与购票助手对话。', stage: '', tone: 'error', model: '' })
+    scrollBottom()
+    return
+  }
+  messages.push({ role: 'user', text: content })
+  const cur = pushAssistant()
+  sending.value = true
+  scrollBottom()
+  abortFn = stream(content, token, makeOnEvent(cur), makeOnDone(cur))
 }
 
 function stopStream() {
@@ -460,6 +517,15 @@ async function newChatHere() {
             <div class="af-bubble">
               <span v-if="m.stage" class="af-stage">{{ m.stage }}</span>
               <div v-if="m.text" class="af-text">{{ m.text }}</div>
+              <!-- 结构化确认：按钮直接把 intent_id 带回后端，用户不必打字「确认」 -->
+              <div v-if="m.intentId && !sending" class="af-confirm-acts">
+                <button type="button" class="af-ok" @click="decideBuy(m, true)">确认下单</button>
+                <button type="button" class="af-cancel" @click="decideBuy(m, false)">取消</button>
+              </div>
+              <!-- 支付按钮：同样脱离关键词路径 -->
+              <div v-if="m.payRequestId && !sending" class="af-confirm-acts">
+                <button type="button" class="af-ok" @click="payOrder(m)">支付</button>
+              </div>
               <div v-if="m.model" class="af-meta">经 {{ m.model }}</div>
             </div>
           </div>
@@ -773,6 +839,39 @@ async function newChatHere() {
 .af-tone-confirm .af-bubble {
   background: #eaf2ff;
   border-color: #b9cff2;
+}
+/* 结构化确认按钮：直接带回 intent_id，不必让用户打字「确认」 */
+.af-confirm-acts {
+  display: flex;
+  gap: 8px;
+  margin-top: 10px;
+}
+.af-confirm-acts button {
+  padding: 4px 14px;
+  border-radius: 14px;
+  font-size: 13px;
+  font-family: inherit;
+  cursor: pointer;
+  border: 1px solid #d5dce5;
+}
+.af-ok {
+  background: #1e4e8c;
+  border-color: #1e4e8c;
+  color: #fff;
+}
+.af-ok:hover {
+  background: #17406f;
+}
+.af-cancel {
+  background: #fff;
+  color: #46586b;
+}
+.af-cancel:hover {
+  background: #f2f6fc;
+}
+.af-confirm-acts button:focus-visible {
+  outline: 2px solid #1e4e8c;
+  outline-offset: 1px;
 }
 .af-tone-success .af-bubble {
   background: #edf7ed;

@@ -29,17 +29,8 @@ function scrollBottom() {
   })
 }
 
-async function send(text) {
-  const content = (text ?? input.value).trim()
-  if (!content || sending.value) return
-  input.value = ''
-  sending.value = true
-
-  const current = { role: 'assistant', text: '', stage: '正在处理…', tone: 'normal', model: '' }
-  messages.push({ role: 'user', text: content })
-  messages.push(current)
-  scrollBottom()
-
+// 事件与收尾处理抽出来，供「发消息」和「确认/取消按钮」两条路径共用
+function makeHandlers(current) {
   // 后端实际推送的事件类型：think / result / answer / confirm / error
   // （见 backend-python/app/agent/orchestrator.py 中的 _event 调用）
   const onEvent = (ev) => {
@@ -53,6 +44,10 @@ async function send(text) {
       current.stage = ''
       current.text = current.text ? `${current.text}\n${ev.text}` : ev.text
       current.tone = 'normal'
+      // 结构化确认：存下 intent_id，由「确认下单 / 取消」按钮原样回传
+      if (ev.intent_id) current.intentId = ev.intent_id
+      // 下单成功后后端带回 requestId，据此渲染「支付」按钮（同样不打字）
+      if (ev.pay_request_id) current.payRequestId = ev.pay_request_id
     } else if (ev.kind === 'result' || ev.kind === 'answer') {
       current.stage = ''
       // 追加而非覆盖，避免后续事件把查询结果冲掉
@@ -77,7 +72,63 @@ async function send(text) {
     }
     scrollBottom()
   }
+  return { onEvent, onDone }
+}
 
+function pushAssistant() {
+  // intentId / payRequestId 一开始就声明，保证后面赋值时是已追踪的属性
+  const current = { role: 'assistant', text: '', stage: '正在处理…', tone: 'normal', model: '', intentId: '', payRequestId: '' }
+  messages.push(current)
+  return current
+}
+
+/** 点「支付」：走显式的 action=pay 载荷，同样不经过自然语言。 */
+async function payOrder(msg) {
+  if (sending.value) return
+  const rid = msg.payRequestId
+  if (!rid) return
+  msg.payRequestId = ''                      // 用掉即清，防止重复支付
+  const token = localStorage.getItem('resv_token')
+  if (!token) return
+
+  sending.value = true
+  messages.push({ role: 'user', text: '［支付］' })
+  const current = pushAssistant()
+  scrollBottom()
+  const { onEvent, onDone } = makeHandlers(current)
+  abort = chatStream('', token, onEvent, onDone, { action: 'pay', confirm: true })
+}
+
+/**
+ * 点「确认下单 / 取消」：带上 intent_id 走结构化确认路径，不经过自然语言。
+ * 这也意味着「好的，但我想改时间」这类句子不会再触发出票。
+ */
+async function decideBuy(msg, confirm) {
+  if (sending.value) return
+  const intentId = msg.intentId
+  if (!intentId) return
+  msg.intentId = ''                          // 用掉即清，防止重复点击重复提交
+  const token = localStorage.getItem('resv_token')
+  if (!token) return
+
+  sending.value = true
+  messages.push({ role: 'user', text: confirm ? '［确认下单］' : '［取消下单］' })
+  const current = pushAssistant()
+  scrollBottom()
+  const { onEvent, onDone } = makeHandlers(current)
+  abort = chatStream('', token, onEvent, onDone, { confirm, intent_id: intentId })
+}
+
+async function send(text) {
+  const content = (text ?? input.value).trim()
+  if (!content || sending.value) return
+  input.value = ''
+  sending.value = true
+
+  messages.push({ role: 'user', text: content })
+  const current = pushAssistant()
+  scrollBottom()
+  const { onEvent, onDone } = makeHandlers(current)
   abort = chatStream(content, localStorage.getItem('resv_token'), onEvent, onDone)
 }
 
@@ -199,6 +250,15 @@ async function newConversation() {
             <div class="bubble">
               <span v-if="m.stage" class="stage">{{ m.stage }}</span>
               <div v-if="m.text" class="text">{{ m.text }}</div>
+              <!-- 结构化确认：按钮直接把 intent_id 带回后端，用户不必打字「确认」 -->
+              <div v-if="m.intentId && !sending" class="confirm-acts">
+                <el-button type="primary" size="small" @click="decideBuy(m, true)">确认下单</el-button>
+                <el-button size="small" @click="decideBuy(m, false)">取消</el-button>
+              </div>
+              <!-- 支付按钮：同样脱离关键词路径 -->
+              <div v-if="m.payRequestId && !sending" class="confirm-acts">
+                <el-button type="primary" size="small" @click="payOrder(m)">支付</el-button>
+              </div>
               <div v-if="m.model" class="meta">经 {{ m.model }}</div>
             </div>
           </div>
@@ -347,6 +407,13 @@ async function newConversation() {
   margin-top: 6px;
   font-size: 11px;
   color: #9aa7b5;
+}
+/* 结构化确认按钮：直接带回 intent_id，不必让用户打字「确认」 */
+.confirm-acts {
+  margin-top: 10px;
+  display: flex;
+  gap: 8px;
+  white-space: normal; /* 抵消 .bubble 的 pre-wrap，避免按钮与文字挤在一行 */
 }
 .quick {
   padding: 4px 12px 8px;
