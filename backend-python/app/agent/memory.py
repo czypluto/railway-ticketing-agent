@@ -14,8 +14,17 @@ logger = logging.getLogger(__name__)
 
 KEY_PREFIX = "mem:agent:"
 TTL_SEC = 3600
-RAW_LIMIT = 10               # 保留最近 ~5 轮原文
+RAW_LIMIT = 10               # 压缩后保留最近 ~5 轮原文（保证指代细节不丢）
 SUMMARY_MAX = 1200           # 摘要上限（字）
+# 高水位：涨到这个条数才压缩，压完裁回 RAW_LIMIT。
+#
+# 原来用 `> RAW_LIMIT` 触发 —— 压完是 10，下一轮 +2 立刻又超，于是**每轮都压一次**。
+# 用量记账实测：~40 轮对话产生 34 次 gen 调用，**占掉 43% 的模型成本**。
+# 加了水位后大约每 4 轮压一次（16→18 触发），压缩调用降到约 1/4。
+#
+# 代价：两轮压缩之间保留的原文更多（最多 18 条 ≈ 9 轮），每轮注入的上下文变大。
+# 这是「少压几次」换「上下文略长」的取舍，靠 cost_report 的输入/输出占比来判断是否划算。
+COMPRESS_AT = 16
 _STATE = ("summary", "msgs")
 
 _fallback: dict[int, dict] = {}
@@ -136,7 +145,7 @@ async def append(user_id, user_text, reply, session=""):
     msgs.append({"role": "assistant", "content": reply[:1500]})
 
     summary = st.get("summary", "")
-    if len(msgs) > RAW_LIMIT:
+    if len(msgs) > COMPRESS_AT:
         evicted, keep = msgs[:-RAW_LIMIT], msgs[-RAW_LIMIT:]
         summary = await _compress(summary, evicted)
         msgs = keep

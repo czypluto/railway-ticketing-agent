@@ -8,7 +8,7 @@ from fastapi import APIRouter
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
-from .. import trace
+from .. import trace, usage
 from ..agent import history as hist
 from ..agent import memory as mem
 from ..agent.orchestrator import AgentService
@@ -51,6 +51,7 @@ async def _stream(body: ChatBody):
 
     last = None
     lines: list[str] = []
+    ok = True
     try:
         uid = current_user().user_id
     except Exception:  # noqa: BLE001
@@ -63,15 +64,21 @@ async def _stream(body: ChatBody):
                 lines.append(ev.get("text") or "")
             yield f"data: {json.dumps(ev, ensure_ascii=False)}\n\n"
     except PermissionError as e:
+        ok = False
         ev = {"kind": "error", "text": str(e), "model": ""}
         yield f"data: {json.dumps(ev, ensure_ascii=False)}\n\n"
     except Exception as e:  # noqa: BLE001
+        ok = False
         logger.exception("编排异常 trace=%s", tid)
         ev = {"kind": "error", "text": f"处理出错：{e}（trace {tid}）", "model": ""}
         yield f"data: {json.dumps(ev, ensure_ascii=False)}\n\n"
     finally:
-        logger.info("对话结束 trace=%s 耗时=%dms 事件=%d",
-                    tid, int((time.perf_counter() - t0) * 1000), len(lines))
+        # 轮次耗时记进同一个用量账本（kind=turn），报告里能按 traceId
+        # 把「这轮多慢」和「这轮多少钱」对上。
+        elapsed_ms = int((time.perf_counter() - t0) * 1000)
+        logger.info("对话结束 trace=%s 耗时=%dms 事件=%d ok=%s",
+                    tid, elapsed_ms, len(lines), ok)
+        usage.record_turn(tid, elapsed_ms, len(lines), ok)
         if uid:
             try:
                 # 1) 全量对话档案（可回溯）
