@@ -109,7 +109,11 @@ def buy_body(token: str) -> dict:
 
 
 def reset(user: str) -> None:
-    """清该用户订单 + 一人一票占位，让每一阶段都能真正下单。
+    """清该用户订单 + 一人一票占位 + 余票/座位号，让每一阶段都能真正下单。
+
+    余票与座位号必须一起清：删订单不会把已扣的库存还回去，只删订单的话
+    余票会只减不增，跑几次就漂移。删掉 stock 键后，下次下单会走
+    decr→-2→preheat 重新按「总席位 − 在售订单」算出正确值。
 
     只在 Redis 活着时调用（故障阶段容器是停的）。
     """
@@ -117,9 +121,10 @@ def reset(user: str) -> None:
                     "-e", f"use resv; delete o from ticket_order o join sys_user u "
                           f"on o.user_id=u.id where u.username='{user}';"],
                    capture_output=True)
-    keys = docker("exec", REDIS_CONTAINER, "redis-cli", "KEYS", "rv:active:*").split()
-    if keys:
-        docker("exec", REDIS_CONTAINER, "redis-cli", "DEL", *keys)
+    for pattern in ("rv:active:*", "rv:stock:*", "rv:seat:*"):
+        keys = docker("exec", REDIS_CONTAINER, "redis-cli", "KEYS", pattern).split()
+        if keys:
+            docker("exec", REDIS_CONTAINER, "redis-cli", "DEL", *keys)
 
 
 def main() -> None:

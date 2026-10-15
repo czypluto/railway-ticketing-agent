@@ -56,14 +56,19 @@ def _mysql(sql: str) -> str:
 
 
 def reset(username: str) -> None:
-    """清该用户的订单 + 挂起状态，让用例之间互不干扰。
+    """清该用户的订单 + 挂起状态 + 余票/座位号，让用例之间互不干扰。
 
     刻意**不用 FLUSHDB**：那会删掉订单流 rv:stream:orders 的消费组，
     之后所有订单都落不了库（详见 scripts/README 与 reset-demo.sh 的说明）。
+
+    余票与座位号要一起清：删订单不会把已扣的库存还回去，只删订单的话
+    余票会只减不增，跑几十个用例后余票耗尽、A 类用例会假失败。
+    删掉 stock 键后，下次下单走 decr→-2→preheat 重新算正确值。
     """
     _mysql(f"use resv; delete o from ticket_order o "
            f"join sys_user u on o.user_id=u.id where u.username='{username}';")
-    for pattern in ("resv:agent:*", "rv:active:*", "rv:inflight:*"):
+    for pattern in ("resv:agent:*", "rv:active:*", "rv:inflight:*",
+                    "rv:stock:*", "rv:seat:*"):
         keys = subprocess.run(["docker", "exec", "resv-redis", "redis-cli", "KEYS", pattern],
                               capture_output=True, text=True).stdout.split()
         if keys:
