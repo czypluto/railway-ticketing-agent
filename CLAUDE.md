@@ -46,6 +46,10 @@ scripts/         启动/联调脚本
 - 权限放行与政策校验只由 Java 确定性规则层判定（`railway/TicketPolicy.java`，不经过 LLM）；模型只负责把结论解释给用户。
 - 工具与 REST 单一来源：Python 只经 REST 调 Java（`app/java_client.py`），不直连业务库。工具 schema 在 `app/tools.py` 手工维护，与 Java 接口的对应关系目前靠人工同步（未实现启动时自动校验，属待办）。
 - Python：Token 校验失败即 401，不进入 RAG、不调 Java。
+- Agent 挂起状态（待确认意向/待支付订单/查票结果）走 Redis（`app/agent/pending.py`），
+  不放进程内存——多副本不串号、重启不丢；Redis 不可用时退回进程内存并打 warning。
+- 下单确认认**结构化载荷**：前端把 `intent_id` 原样带回，后端比对后执行。
+  过渡期关键词回退由 `AGENT_CONFIRM_LEGACY` 控制（默认 1）；前端已支持，上线后置 0。
 
 ## 前端与文案口味
 
