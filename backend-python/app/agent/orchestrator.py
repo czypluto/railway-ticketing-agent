@@ -8,7 +8,6 @@
 import asyncio
 import logging
 import os
-import uuid
 from datetime import date
 from typing import AsyncIterator, Optional
 
