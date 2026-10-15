@@ -30,6 +30,20 @@ python scripts/chat_e2e.py zhanggong "帮我查明天北京南到上海虹桥的
 bash scripts/reset-demo.sh
 ```
 
+## 依赖故障演练
+
+| 脚本 | 作用 |
+|---|---|
+| `circuit_breaker_check.py` | 停掉 Redis，验证熔断快速失败与自动恢复 |
+
+Redis 是下单链路的强依赖。停掉它之后：前 5 个请求各等 3s 超时才失败（阈值），
+之后熔断打开，**21–49 ms 就返回 503**（约快 70 倍），恢复后自动闭合。
+实测数据见脚本头部注释。
+
+```bash
+python scripts/circuit_breaker_check.py      # 会 stop/start resv-redis
+```
+
 ## Agent 行为层评测
 
 | 脚本 | 作用 |

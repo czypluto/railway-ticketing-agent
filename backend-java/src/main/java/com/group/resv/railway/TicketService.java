@@ -15,6 +15,7 @@ import com.group.resv.railway.repo.TrainRepository;
 import com.group.resv.railway.repo.TrainStopRepository;
 import com.group.resv.railway.repo.TripClassRepository;
 import com.group.resv.railway.repo.TripRepository;
+import com.group.resv.redis.DependencyCircuitBreaker;
 import com.group.resv.redis.RateLimiter;
 import com.group.resv.repo.ContactRepository;
 import com.group.resv.repo.UserRepository;
@@ -63,6 +64,7 @@ public class TicketService {
     private final StringRedisTemplate redis;
     private final RedissonClient redisson;
     private final RateLimiter rateLimiter;
+    private final DependencyCircuitBreaker breaker;
     private final TicketPolicy policy;
 
     public TicketService(TripRepository tripRepository,
@@ -77,6 +79,7 @@ public class TicketService {
                          StringRedisTemplate redis,
                          RedissonClient redisson,
                          RateLimiter rateLimiter,
+                         DependencyCircuitBreaker breaker,
                          TicketPolicy policy) {
         this.tripRepository = tripRepository;
         this.trainRepository = trainRepository;
@@ -90,6 +93,7 @@ public class TicketService {
         this.redis = redis;
         this.redisson = redisson;
         this.rateLimiter = rateLimiter;
+        this.breaker = breaker;
         this.policy = policy;
     }
 
@@ -225,8 +229,16 @@ public class TicketService {
         RLock lock = redisson.getLock("rv:req:" + requestId);
         boolean locked = false;
         try {
-            locked = lock.tryLock(0, 5, TimeUnit.SECONDS);
+            locked = breaker.call("redis", () -> {
+                try {
+                    return lock.tryLock(0, 5, TimeUnit.SECONDS);
+                } catch (InterruptedException ie) {
+                    Thread.currentThread().interrupt();
+                    throw new BizException(503, "请求被中断，请重试");
+                }
+            });
             if (!locked) {
+                // 拿不到锁是业务结果（并发重复提交），不是依赖故障——不该计入熔断
                 throw new BizException(409, "请勿重复提交");
             }
             // 二次查重（锁内）
@@ -237,8 +249,8 @@ public class TicketService {
 
             // 一人一票活跃占位（车次级 SETNX 原子准入，防并发“先查后写”重复下单）
             String activeKey = RailwayKeys.active(user.userId(), trip.getId());
-            Boolean acquired = redis.opsForValue().setIfAbsent(
-                    activeKey, "1", Duration.ofMinutes(30)); // 兜底租约；正常走 cancel/expire 显式释放
+            Boolean acquired = breaker.call("redis", () -> redis.opsForValue().setIfAbsent(
+                    activeKey, "1", Duration.ofMinutes(30))); // 兜底租约；正常走 cancel/expire 显式释放
             if (!Boolean.TRUE.equals(acquired)) {
                 throw new BizException(409, "您已购买该车次车票，一人一票，请勿重复购买");
             }
@@ -255,8 +267,8 @@ public class TicketService {
             }
 
             // 座位分配：原子递增取号，已分配的座不会再给第二个用户
-            long seatNo = redis.opsForValue().increment(
-                    RailwayKeys.seatSeq(trip.getId(), tc.getSeatClass()));
+            long seatNo = breaker.call("redis", () -> redis.opsForValue().increment(
+                    RailwayKeys.seatSeq(trip.getId(), tc.getSeatClass())));
 
             String from = name(stops.get(fromIdx).getStationId());
             String to = name(stops.get(toIdx).getStationId());
@@ -282,19 +294,31 @@ public class TicketService {
             // 必须写在 XADD 之前，这样 XADD 失败时也能立刻回补。
             String inflightKey = RailwayKeys.inflight(requestId);
             long nowMs = System.currentTimeMillis();
-            redis.opsForValue().set(inflightKey,
-                    trip.getId() + "|" + tc.getSeatClass() + "|" + user.userId() + "|" + nowMs,
-                    Duration.ofMinutes(15));
-            redis.opsForZSet().add(RailwayKeys.inflightIndex(), requestId, nowMs);
+            breaker.run("redis", () -> {
+                redis.opsForValue().set(inflightKey,
+                        trip.getId() + "|" + tc.getSeatClass() + "|" + user.userId() + "|" + nowMs,
+                        Duration.ofMinutes(15));
+                redis.opsForZSet().add(RailwayKeys.inflightIndex(), requestId, nowMs);
+            });
             try {
-                redis.opsForStream().add(RailwayKeys.orderStream(), event);
+                breaker.run("redis", () ->
+                        redis.opsForStream().add(RailwayKeys.orderStream(), event));
             } catch (RuntimeException e) {
                 // 写 Stream 失败 = 本次购买作废：占位、在途登记、**以及已扣的库存**都要还回去。
                 // （此前只释放了占位，扣掉的那张票会永久泄漏）
-                redis.delete(activeKey);
-                redis.delete(inflightKey);
-                redis.opsForZSet().remove(RailwayKeys.inflightIndex(), requestId);
-                stockService.release(trip.getId(), tc.getSeatClass());
+                //
+                // 补偿是尽力而为：Redis 已经不可用时这些 delete 大概率同样失败。
+                // 不能让补偿的异常盖掉原始异常——那会把"为什么失败"这条线索弄丢。
+                // 真正的兜底是 TicketInflightReconcileJob：在途登记没被销掉，它会把余票补回来。
+                try {
+                    redis.delete(activeKey);
+                    redis.delete(inflightKey);
+                    redis.opsForZSet().remove(RailwayKeys.inflightIndex(), requestId);
+                    stockService.release(trip.getId(), tc.getSeatClass());
+                } catch (RuntimeException comp) {
+                    log.warn("购票失败后的补偿未全部完成，交由在途对账兜底 requestId={}：{}",
+                            requestId, comp.toString());
+                }
                 throw e;
             }
 
@@ -316,9 +340,6 @@ public class TicketService {
             m.put("from", from);
             m.put("to", to);
             return m;
-        } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
-            throw new BizException(500, "系统繁忙");
         } finally {
             if (locked && lock.isHeldByCurrentThread()) {
                 lock.unlock();

@@ -39,6 +39,13 @@ app:
     # 令牌桶参数（Redis+Lua，全局限流）
     qps: ${SECKILL_QPS:1000}
     burst: ${SECKILL_BURST:2000}
+  circuit:
+    # Redis 熔断：连续失败达阈值即打开，期间请求快速失败 503（不再逐个等超时）；
+    # 冷却后转半开、放一个试探请求，成功则闭合。
+    # 为什么是 5 次 / 10s：Lettuce 命令超时 3s，5 次失败约 15s 内触发——再拖线程池就顶不住了；
+    # 冷却 10s 比常见的网络抖动尺度长一点，避免刚恢复就被打回。
+    failure-threshold: ${CIRCUIT_FAILURE_THRESHOLD:5}
+    open-millis: ${CIRCUIT_OPEN_MILLIS:10000}
   stream:
     # Stream key 由 RailwayKeys.orderStream() 统一维护（生产端与消费端共用同一常量），不放配置。
     # 此前配置里写的是 order-g/order-c1，代码里硬编码 rv-order-g/rv-order-c1，两边对不上且配置从未被读取。

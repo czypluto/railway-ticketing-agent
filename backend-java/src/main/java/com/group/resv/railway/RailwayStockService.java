@@ -4,6 +4,7 @@ import com.group.resv.railway.domain.TicketOrder;
 import com.group.resv.railway.domain.TripClass;
 import com.group.resv.railway.repo.TicketOrderRepository;
 import com.group.resv.railway.repo.TripClassRepository;
+import com.group.resv.redis.DependencyCircuitBreaker;
 import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.data.redis.core.script.DefaultRedisScript;
 import org.springframework.stereotype.Service;
@@ -24,15 +25,18 @@ public class RailwayStockService {
     private final DefaultRedisScript<Long> stockDecrScript;
     private final TripClassRepository tripClassRepository;
     private final TicketOrderRepository orderRepository;
+    private final DependencyCircuitBreaker breaker;
 
     public RailwayStockService(StringRedisTemplate redis,
                                DefaultRedisScript<Long> stockDecrScript,
                                TripClassRepository tripClassRepository,
-                               TicketOrderRepository orderRepository) {
+                               TicketOrderRepository orderRepository,
+                               DependencyCircuitBreaker breaker) {
         this.redis = redis;
         this.stockDecrScript = stockDecrScript;
         this.tripClassRepository = tripClassRepository;
         this.orderRepository = orderRepository;
+        this.breaker = breaker;
     }
 
     /**
@@ -57,7 +61,8 @@ public class RailwayStockService {
 
     /** 当前余票；未预热返回总席位。 */
     public long remaining(Long tripId, String seatClass) {
-        String v = redis.opsForValue().get(RailwayKeys.stock(tripId, seatClass));
+        String v = breaker.call("redis", () ->
+                redis.opsForValue().get(RailwayKeys.stock(tripId, seatClass)));
         if (v != null) {
             return Long.parseLong(v);
         }
@@ -67,24 +72,30 @@ public class RailwayStockService {
 
     /**
      * 原子扣减一张。返回 0 及以上=剩余；-1=无票；-2=未预热（需先 preheat 再扣）。
+     *
+     * -1/-2 是**返回值**不是异常，所以不会被熔断计为故障。
+     * Redis 真的不可用时这里会抛出去 → 熔断器计数 → 达阈值后快速失败。
      */
     public long decr(Long tripId, String seatClass) {
-        Long r = redis.execute(stockDecrScript, List.of(RailwayKeys.stock(tripId, seatClass)));
+        Long r = breaker.call("redis", () ->
+                redis.execute(stockDecrScript, List.of(RailwayKeys.stock(tripId, seatClass))));
         return r == null ? -2 : r;
     }
 
     /** 退票回补一张，不超总席位。 */
     public void release(Long tripId, String seatClass) {
         String key = RailwayKeys.stock(tripId, seatClass);
-        String v = redis.opsForValue().get(key);
-        if (v == null) {
-            return;
-        }
-        long cur = Long.parseLong(v);
-        Optional<TripClass> tc = tripClassRepository.findByTripIdAndSeatClass(tripId, seatClass);
-        long cap = tc.map(t -> (long) t.getTotalSeats()).orElse(cur);
-        if (cur < cap) {
-            redis.opsForValue().increment(key);
-        }
+        breaker.run("redis", () -> {
+            String v = redis.opsForValue().get(key);
+            if (v == null) {
+                return;
+            }
+            long cur = Long.parseLong(v);
+            Optional<TripClass> tc = tripClassRepository.findByTripIdAndSeatClass(tripId, seatClass);
+            long cap = tc.map(t -> (long) t.getTotalSeats()).orElse(cur);
+            if (cur < cap) {
+                redis.opsForValue().increment(key);
+            }
+        });
     }
 }

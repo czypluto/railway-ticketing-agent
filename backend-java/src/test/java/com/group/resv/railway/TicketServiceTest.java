@@ -8,6 +8,7 @@ import com.group.resv.railway.repo.TrainRepository;
 import com.group.resv.railway.repo.TrainStopRepository;
 import com.group.resv.railway.repo.TripClassRepository;
 import com.group.resv.railway.repo.TripRepository;
+import com.group.resv.redis.DependencyCircuitBreaker;
 import com.group.resv.redis.RateLimiter;
 import com.group.resv.repo.ContactRepository;
 import com.group.resv.repo.UserRepository;
@@ -15,6 +16,7 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
 import org.mockito.InjectMocks;
 import org.mockito.Mock;
+import org.mockito.Spy;
 import org.mockito.junit.jupiter.MockitoExtension;
 import org.redisson.api.RedissonClient;
 import org.springframework.data.redis.core.StringRedisTemplate;
@@ -46,6 +48,9 @@ class TicketServiceTest {
     @Mock RedissonClient redisson;
     @Mock RateLimiter rateLimiter;
     @Mock TicketPolicy policy;
+    /** 用真实实例而不是 @Mock：熔断器是无依赖的纯逻辑，
+     *  被 mock 掉后 call() 会直接返回 null、根本不执行被包装的动作。 */
+    @Spy DependencyCircuitBreaker breaker = new DependencyCircuitBreaker(5, 60_000);
 
     @InjectMocks TicketService ticketService;
 
