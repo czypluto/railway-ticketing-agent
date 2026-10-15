@@ -8,6 +8,7 @@
 import logging
 import math
 import re
+from array import array
 from pathlib import Path
 from typing import Optional
 
@@ -90,21 +91,86 @@ def visible(dept_tags, department: str) -> bool:
     return ("all" in dept_tags) or (bool(d) and d in dept_tags)
 
 
-def build_page_index(rows: list[dict]) -> tuple[dict, dict, int, float]:
-    """由 Milvus 行构造「页」级索引，返回 (pages, df, total, avgdl)。
+class PageIndex:
+    """页级关键词索引（BM25 用）。
+
+    为什么不是「每页存一个 tf dict」：
+      那是 N 个独立的 Python dict 对象。实测 8000 页时 tf 占 95% 内存
+      （23 KB/页，而一页正文只有 0.9 KB）——25 倍开销。10 万页约 2.5 GB，
+      而 `_ensure_page_index` 的 limit 是 200000（外推约 4.9 GB）。
+
+    改成单个倒排 + 紧凑整型数组（`array('i')`）后：
+      - 内存约为原来的 1/11
+      - 打分只扫「含查询词元的页」，查询复杂度从 O(总页数) 降到 O(命中页)
+
+    槽位：idx 0..total-1，`keys[idx]` 还原为 (来源, parent_id)。
+    """
+
+    __slots__ = ("keys", "pages", "depts", "dls", "postings", "df", "total", "avgdl")
+
+    def __init__(self) -> None:
+        self.keys: list[tuple[str, int]] = []
+        self.pages: dict = {}          # key -> {text, dept, source, page_no, heading}
+        self.depts: list[set] = []     # idx -> dept 集合（按引用共享，不额外占内存）
+        self.dls: list[int] = []       # idx -> 页长度（tf 计数之和）
+        self.postings: dict = {}       # token -> array('i')，扁平 [idx, cnt, idx, cnt, ...]
+        self.df: dict = {}             # token -> 含该词的页数
+        self.total = 0
+        self.avgdl = 0.0
+
+    def rank(self, query_tokens: list[str], department: str,
+             limit: int) -> list[tuple[tuple[str, int], float]]:
+        """BM25 打分排序，返回 [(key, score)]，只含 score > 0 的页。
+
+        与旧的「逐页取 tf dict 算分」**逐位等价**：
+        - 候选集 = 至少含一个查询词元的页；旧实现里 score 恰为 0 的页本来也会被丢掉
+        - 每页的累加顺序仍是 `set(query_tokens)` 的迭代顺序，与旧实现相同
+        - 公式、k1/b、idf、dl、avgdl 全部照旧
+        """
+        if not self.total:
+            return []
+        k1, b = 1.5, 0.75
+        n = max(self.total, 1)
+        avgdl = max(self.avgdl, 1.0)
+
+        cand: dict[int, float] = {}
+        for t in set(query_tokens):
+            post = self.postings.get(t)
+            if not post:
+                continue
+            df = self.df.get(t, 0)
+            idf = math.log(1.0 + (n - df + 0.5) / (df + 0.5))
+            for i in range(0, len(post), 2):
+                pi = post[i]
+                # 权限过滤只对候选页判定，比旧实现「先遍历全部页过滤」更省
+                if not visible(self.depts[pi], department):
+                    continue
+                f = post[i + 1]
+                dl = self.dls[pi] or 1
+                cand[pi] = cand.get(pi, 0.0) + idf * (f * (k1 + 1.0)) / (
+                    f + k1 * (1.0 - b + b * dl / avgdl))
+
+        scored = [(s, self.keys[pi]) for pi, s in cand.items() if s > 0]
+        # 并列时按 (来源, 页) 定序，保证可复现
+        scored.sort(key=lambda x: (-x[0], x[1]))
+        return [(key, s) for s, key in scored[:limit]]
+
+
+def build_page_index(rows: list[dict]) -> PageIndex:
+    """由 Milvus 行构造「页」级索引。
 
     **key 必须是 (来源, parent_id)**：parent_id 是每个文档各自从 1 开始编号的，
     只用 parent_id 会让不同文档的同号页互相覆盖——正文丢失、部门标签串味、
     检索结果张冠李戴。抽成纯函数是为了能被单测钉住（见 tests/test_rag_index.py）。
     """
-    pages: dict = {}
+    idx = PageIndex()
     for r in rows:
         pid = r.get("parent_id")
         if pid is None:
             continue
         src = r.get("source") or ""
         key = (src, pid)
-        rec = pages.get(key)
+        rec = idx.pages.get(key)
         if rec is None:
             rec = {
                 "text": r.get("parent_text") or "",
@@ -112,21 +178,27 @@ def build_page_index(rows: list[dict]) -> tuple[dict, dict, int, float]:
                 "source": src,
                 "page_no": r.get("page_no"),
                 "heading": r.get("heading") or "",
-                "tf": {},
-                "dl": 0,
             }
-            pages[key] = rec
+            idx.pages[key] = rec
+            idx.keys.append(key)
         rec["dept"].add(r.get("dept_tags") or "all")
 
-    df: dict = {}
-    for rec in pages.values():
-        rec["tf"] = _count_tokens(rec["text"])
-        rec["dl"] = sum(rec["tf"].values())
-        for t in rec["tf"]:
-            df[t] = df.get(t, 0) + 1
-    total = len(pages)
-    avgdl = (sum(r["dl"] for r in pages.values()) / total) if total else 0.0
-    return pages, df, total, avgdl
+    # 单倒排：token -> 扁平 [idx, cnt, ...]；df 由 postings 长度推出，不单独维护。
+    postings: dict[str, array] = {}
+    for i, key in enumerate(idx.keys):
+        rec = idx.pages[key]
+        tf = _count_tokens(rec["text"])
+        dl = sum(tf.values())
+        idx.dls.append(dl)
+        idx.depts.append(rec["dept"])
+        for t, c in tf.items():
+            postings.setdefault(t, array("i")).extend((i, c))
+
+    idx.postings = postings
+    idx.df = {t: len(p) // 2 for t, p in postings.items()}
+    idx.total = len(idx.keys)
+    idx.avgdl = (sum(idx.dls) / idx.total) if idx.total else 0.0
+    return idx
 
 
 # ---- 中文词面检索：CJK 用重叠 bigram，英文/数字整词；无需分词依赖，规则/条款术语命中稳定 ----
@@ -160,10 +232,7 @@ class RagStore:
         self._client = None
         self._collection = None
         # 页级关键词索引（懒加载，供 BM25 检索路提升召回；增删文档后失效重建）
-        self._page_index: Optional[dict] = None
-        self._df: dict = {}
-        self._total = 0
-        self._avgdl = 0.0
+        self._page_index: Optional[PageIndex] = None
         if not self.enabled:
             logger.warning("未安装 pymilvus，RAG 关闭")
             return
@@ -354,6 +423,12 @@ class RagStore:
         """懒加载“页”级关键词索引（Big 粒度），key 为 (来源, parent_id)。
 
         增删文档后调用方把 _page_index 置 None 即触发重建。
+
+        ⚠️ 全量拉取：一次 query 取回整个 collection（含每页正文）。
+        容量实测（22 篇语料重组成页）：构建约 0.21 s / 1000 页，
+        重建发生在请求路径里，期间的请求会被阻塞；到 limit 上限
+        200000 页时外推约 42 s。语料再大需要改增量维护，
+        或把倒排挪到独立检索组件。
         """
         if self._page_index is not None or not (self.enabled and self._collection):
             return
@@ -366,23 +441,7 @@ class RagStore:
         except Exception as e:  # noqa: BLE001
             logger.warning("加载关键词索引失败：%s", e)
             rows = []
-        self._page_index, self._df, self._total, self._avgdl = build_page_index(rows)
-
-    def _bm25(self, rec: dict, query_tokens: list[str]) -> float:
-        k1, b = 1.5, 0.75
-        n = max(self._total, 1)
-        avgdl = max(self._avgdl, 1.0)
-        dl = rec.get("dl") or 1
-        tf = rec.get("tf") or {}
-        score = 0.0
-        for t in set(query_tokens):
-            f = tf.get(t, 0)
-            if not f:
-                continue
-            df = self._df.get(t, 0) or 0
-            idf = math.log(1.0 + (n - df + 0.5) / (df + 0.5))
-            score += idf * (f * (k1 + 1.0)) / (f + k1 * (1.0 - b + b * dl / avgdl))
-        return score
+        self._page_index = build_page_index(rows)
 
     async def retrieve(self, query: str, department: str, top_k: int = 5,
                        mode: str = "hybrid") -> list[str]:
@@ -432,22 +491,14 @@ class RagStore:
         self._ensure_page_index()
 
         # 2) BM25 关键词路（补召回）
+        # 倒排打分只扫「含查询词元的页」，不再遍历全部页；并列时按 (来源, 页) 定序，
+        # 保证同一输入两次跑出同样顺序（评测可复现）。
         kw_rank: list[tuple[str, int]] = []
-        if mode in ("hybrid", "bm25"):
-            if self._page_index and self._total:
-                allowed = [key for key, r in self._page_index.items()
-                           if visible(r["dept"], department)]
-                qt = _zh_tokens(query)
-                if qt and allowed:
-                    scored = []
-                    for key in allowed:
-                        s = self._bm25(self._page_index[key], qt)
-                        if s > 0:
-                            scored.append((s, key))
-                    # 并列时按 (来源, 页) 定序：Milvus query 返回的行序不保证稳定，
-                    # 用它当并列的隐式 tie-break 会让同一输入两次跑出不同结果（评测不可复现）。
-                    scored.sort(key=lambda x: (-x[0], x[1]))
-                    kw_rank = [key for _, key in scored[:max(top_k * 2, 8)]]
+        if mode in ("hybrid", "bm25") and self._page_index:
+            qt = _zh_tokens(query)
+            if qt:
+                kw_rank = [key for key, _ in
+                           self._page_index.rank(qt, department, limit=max(top_k * 2, 8))]
 
         # 3) RRF 融合
         k = 60
@@ -467,7 +518,7 @@ class RagStore:
         order = sorted(set(vec_rank) | set(kw_rank), key=lambda k: (-_rrf(k), k))
         out: list[str] = []
         for key in order[:top_k]:
-            rec = (self._page_index or {}).get(key)
+            rec = (self._page_index.pages if self._page_index else {}).get(key)
             if not rec:
                 continue
             text = (rec.get("text") or "").strip()
