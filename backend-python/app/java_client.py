@@ -2,6 +2,7 @@
 
 对应 Java 能力：
   查车站 /api/ticket/stations（只读；管理端的 /api/rail/stations 限 ADMIN）
+  查列车 /api/ticket/trains   、查运行日 /api/ticket/trips（同理，供 Agent 只读用）
   查票   /api/ticket/query
   下单   /api/ticket/buy
   我的订单/支付/退票  /api/ticket/orders/**
@@ -29,6 +30,26 @@ _TIMEOUT = httpx.Timeout(connect=3.0, read=15.0, write=15.0, pool=3.0)
 
 MAX_ATTEMPTS = int(os.getenv("JAVA_MAX_ATTEMPTS", "3"))
 _BACKOFF_BASE = 0.2          # 0.2s → 0.4s
+
+
+async def _resolve_station(name: str) -> int:
+    """站名 -> stationId。
+
+    别名/简写要能命中（用户说"北京"、库里叫"北京南"），但**歧义时必须报错而不是猜**：
+    原实现直接取 rows[0]，一旦库里同时有"北京南/北京西/北京丰台"，
+    用户说"北京"就会静默落到第一条——查的是哪一趟、买的是哪一张，
+    用户和模型都看不出来。宁可让模型回头问一句。
+    """
+    rows = await stations(kw=name)
+    if not rows:
+        raise JavaError(400, f"未找到车站：{name}")
+    exact = [r for r in rows if r.get("name") == name]
+    if len(exact) == 1:
+        return exact[0]["id"]
+    if len(rows) == 1:
+        return rows[0]["id"]
+    names = "、".join(str(r.get("name") or "") for r in rows[:8])
+    raise JavaError(400, f"车站「{name}」不唯一，请指明是以下哪一个：{names}")
 
 
 def _get_client() -> httpx.AsyncClient:
@@ -160,7 +181,8 @@ async def cancel(request_id: str) -> dict:
 
 
 async def list_trains() -> list[dict]:
-    return await _call("GET", "/api/rail/trains") or []
+    # 走业务侧只读接口；/api/rail/trains 是 ADMIN-only，普通用户（含演示账号 zhanggong）会 403
+    return await _call("GET", "/api/ticket/trains") or []
 
 
 async def list_trips(date: Optional[str] = None, train_id: Optional[int] = None) -> list[dict]:
@@ -170,7 +192,7 @@ async def list_trips(date: Optional[str] = None, train_id: Optional[int] = None)
     if train_id:
         params["trainId"] = train_id
     qs = "" if not params else "?" + urlencode(params)
-    return await _call("GET", f"/api/rail/trips{qs}") or []
+    return await _call("GET", f"/api/ticket/trips{qs}") or []
 
 
 async def list_contacts() -> list[dict]:
@@ -193,10 +215,3 @@ async def add_contact(name: str, id_type: Optional[str] = None, id_no: Optional[
 
 async def get_profile() -> dict:
     return await _call("GET", "/api/user/profile")
-
-
-async def _resolve_station(name: str) -> int:
-    rows = await stations(kw=name)
-    if not rows:
-        raise JavaError(400, f"未找到车站：{name}")
-    return rows[0]["id"]

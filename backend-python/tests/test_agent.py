@@ -146,3 +146,97 @@ def test_confirm_event_carries_intent_id():
     """确认事件必须带 intent_id —— 前端要靠它回传，这是结构化确认的前提。"""
     ev = {**orchestrator._event("confirm", "请确认下单"), "intent_id": "abc123"}
     assert ev["kind"] == "confirm" and ev["intent_id"] == "abc123"
+
+
+# ── 意向处置（_intent_verdict）────────────────────────────────────────
+
+def test_intent_verdict_matrix(monkeypatch):
+    monkeypatch.setenv("AGENT_CONFIRM_LEGACY", "0")
+    v = orchestrator._intent_verdict
+
+    # 载荷对得上：确认执行、取消作废
+    assert v(INTENT, "", {"confirm": True, "intent_id": "abc123"}) == "execute"
+    assert v(INTENT, "", {"confirm": False, "intent_id": "abc123"}) == "cancel"
+    # 纯文本且未命中确认词：用户改了主意
+    assert v(INTENT, "帮我查别的", None) == "discard"
+    # 过渡期关键词仍然生效
+    monkeypatch.setenv("AGENT_CONFIRM_LEGACY", "1")
+    assert v(INTENT, "好的", None) == "execute"
+
+
+def test_unrelated_payload_does_not_discard_pending_intent(monkeypatch):
+    """★ 本次修掉的缺陷。
+
+    原实现：intent 存在但判定未命中时**无条件** drop。于是一次无关载荷
+    （比如没有待支付单时误发的支付载荷、或一个过期/串话的载荷）会把用户刚看到的
+    「确认下单」按钮悄悄废掉 —— 用户再点就没反应，且不知道发生了什么。
+
+    现在只有「确实是冲这次意向来的」（intent_id 对得上）或「用户用自然语言改了主意」
+    才作废；对不上的载荷一律 keep。
+    """
+    monkeypatch.setenv("AGENT_CONFIRM_LEGACY", "0")
+    v = orchestrator._intent_verdict
+
+    # 别的用途的载荷（支付）
+    assert v(INTENT, "", {"action": "pay", "confirm": True}) == "keep"
+    # 过期/串话的 intent_id
+    assert v(INTENT, "", {"confirm": True, "intent_id": "deadbeef"}) == "keep"
+    assert v(INTENT, "", {"confirm": False, "intent_id": "deadbeef"}) == "keep"
+    # 空载荷也算对不上
+    assert v(INTENT, "", {}) == "keep"
+
+
+# ── 写交易的 requestId 只能来自系统记下的订单（_known_order_ids）──────
+
+def test_known_order_ids_covers_just_created_and_listed(monkeypatch):
+    """★ 本次补上的防线。
+
+    原来的实现把模型传的 requestId 直接交给 Java。Java 侧有归属校验（付不了别人的单），
+    但模型仍可以在用户没点确认的情况下，把该用户自己的订单付掉/退掉 ——
+    「写数据由确定性代码执行」就漏在这儿。
+    """
+    store = {"order": "REQ-NEW", "orders": [{"requestId": "REQ-B"}, {"requestId": "REQ-C"}]}
+    monkeypatch.setattr(orchestrator.pending, "get", lambda uid, field: store.get(field))
+
+    ids = orchestrator._known_order_ids(1)
+    assert ids == {"REQ-NEW", "REQ-B", "REQ-C"}
+    # 模型编造的 id 不在集合里 —— 工具分发处会据此拒绝
+    assert "REQ-INVENTED" not in ids
+
+
+def test_known_order_ids_empty_when_nothing_seen(monkeypatch):
+    """什么都没见过时集合为空：模型任何 requestId 都会被拒，必须先 my_orders。"""
+    monkeypatch.setattr(orchestrator.pending, "get", lambda uid, field: None)
+    assert orchestrator._known_order_ids(1) == set()
+
+
+def test_known_order_ids_tolerates_rows_without_request_id(monkeypatch):
+    store = {"order": None, "orders": [{"orderNo": "T1"}, {"requestId": "REQ-X"}]}
+    monkeypatch.setattr(orchestrator.pending, "get", lambda uid, field: store.get(field))
+    assert orchestrator._known_order_ids(1) == {"REQ-X"}
+
+
+# ── 工具必填参数 ──────────────────────────────────────────────────────
+
+def test_req_arg_returns_trimmed_value():
+    assert orchestrator._req_arg({"requestId": "  REQ-1 "}, "requestId") == "REQ-1"
+    assert orchestrator._req_arg({"age": 8}, "age") == "8"
+
+
+def test_req_arg_raises_tool_arg_error_instead_of_key_error():
+    """★ 实测暴露的缺陷。
+
+    原先直接写 `args["requestId"]`：模型漏传就抛 KeyError，它不是 JavaError，
+    不会被分发处的 except 接住，一路冒到 chat.py 的兜底 except，
+    用户只看到「处理出错：'requestId'」。现在统一抛 ToolArgError，由分发处
+    转成"某某调用不完整，请补充信息后重试"。
+    """
+    for bad in ({}, {"requestId": None}, {"requestId": ""}, {"requestId": "   "}):
+        try:
+            orchestrator._req_arg(bad, "requestId")
+        except orchestrator.ToolArgError as e:
+            assert "requestId" in str(e)
+        else:
+            raise AssertionError(f"应当抛 ToolArgError：{bad!r}")
+    # 不能是 KeyError（那正是要被消掉的症状）
+    assert not issubclass(orchestrator.ToolArgError, KeyError)

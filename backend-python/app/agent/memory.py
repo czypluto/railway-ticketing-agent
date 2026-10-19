@@ -9,6 +9,7 @@
 import json
 import logging
 import os
+import time
 
 logger = logging.getLogger(__name__)
 
@@ -25,22 +26,41 @@ SUMMARY_MAX = 1200           # 摘要上限（字）
 # 代价：两轮压缩之间保留的原文更多（最多 18 条 ≈ 9 轮），每轮注入的上下文变大。
 # 这是「少压几次」换「上下文略长」的取舍，靠 cost_report 的输入/输出占比来判断是否划算。
 COMPRESS_AT = 16
-_STATE = ("summary", "msgs")
 
 _fallback: dict[int, dict] = {}
+
+# 连接复用 + 失败冷却，与 pending.py 同一套做法（原来每次读写都新建连接并 ping）。
+_CLIENT = None
+_RETRY_AFTER = 0.0
+COOLDOWN_SEC = 30.0
+
+
+def _drop_client(reason: str) -> None:
+    global _CLIENT, _RETRY_AFTER
+    _CLIENT = None
+    _RETRY_AFTER = time.monotonic() + COOLDOWN_SEC
+    logger.warning("记忆 Redis 不可用（%s），%.0fs 内退回进程内存", reason, COOLDOWN_SEC)
+
 
 try:
     import redis as _redis
 
     def _client():
+        global _CLIENT
+        if _CLIENT is not None:
+            return _CLIENT
+        if time.monotonic() < _RETRY_AFTER:
+            return None
         try:
             host = os.getenv("MEMORY_REDIS_HOST", "127.0.0.1")
             port = int(os.getenv("MEMORY_REDIS_PORT", "6379"))
-            c = _redis.Redis(host=host, port=port, decode_responses=True, socket_timeout=1)
+            c = _redis.Redis(host=host, port=port, decode_responses=True,
+                             socket_timeout=1, socket_connect_timeout=1)
             c.ping()
+            _CLIENT = c
             return c
         except Exception as e:  # noqa: BLE001
-            logger.warning("Redis 不可用，记忆退回进程内存：%s", e)
+            _drop_client(str(e))
             return None
 except Exception:  # noqa: BLE001
     _redis = None
@@ -53,25 +73,34 @@ def _key(user_id, session=""):
 
 def _read(user_id, session="") -> dict:
     empty = {"summary": "", "msgs": []}
+    raw = None
     c = _client() if _redis else None
     if c:
-        raw = c.get(_key(user_id, session))
-        if raw:
-            try:
-                d = json.loads(raw)
-                return {"summary": d.get("summary", ""), "msgs": d.get("msgs", [])}
-            except Exception:  # noqa: BLE001
-                return empty
+        try:
+            raw = c.get(_key(user_id, session))
+        except Exception as e:  # noqa: BLE001
+            _drop_client(str(e))
+            c = None
+    if not c:
+        return _fallback.get((user_id, session or "default"), dict(empty))
+    if not raw:
         return empty
-    return _fallback.get((user_id, session or "default"), dict(empty))
+    try:
+        d = json.loads(raw)
+        return {"summary": d.get("summary", ""), "msgs": d.get("msgs", [])}
+    except Exception:  # noqa: BLE001
+        return empty
 
 
 def _write(user_id, session, state):
     c = _client() if _redis else None
     if c:
-        c.setex(_key(user_id, session), TTL_SEC, json.dumps(state, ensure_ascii=False))
-    else:
-        _fallback[(user_id, session or "default")] = state
+        try:
+            c.setex(_key(user_id, session), TTL_SEC, json.dumps(state, ensure_ascii=False))
+            return
+        except Exception as e:  # noqa: BLE001
+            _drop_client(str(e))
+    _fallback[(user_id, session or "default")] = state
 
 
 def load_state(user_id, session="") -> dict:
@@ -156,5 +185,8 @@ async def append(user_id, user_text, reply, session=""):
 def clear(user_id, session=""):
     c = _client() if _redis else None
     if c:
-        c.delete(_key(user_id, session))
+        try:
+            c.delete(_key(user_id, session))
+        except Exception as e:  # noqa: BLE001
+            _drop_client(str(e))
     _fallback.pop((user_id, session or "default"), None)

@@ -91,3 +91,27 @@ def test_redis_really_persists_when_available():
     finally:
         pending.clear(777)
     assert client.get(key) is None, "clear 应当把 Redis 里的键删掉"
+
+
+def test_connection_failure_degrades_and_cools_down(monkeypatch):
+    """连接中途坏掉：丢弃连接、进入冷却期，期间直接走进程内存，绝不抛错。
+
+    连接复用（原实现每次读写都新建连接并 ping）换来的新风险是"连接坏了会一直坏"。
+    这个用例钉住兜底：坏连接被丢弃后，读要退回进程内存，写要落进程内存，
+    且在冷却期内不再尝试重连 —— Redis 真挂的时候，反复去等连接超时才是最贵的。
+    """
+    class Boom:
+        def get(self, *a, **k):
+            raise RuntimeError("connection reset by peer")
+
+    monkeypatch.setattr(pending, "_CLIENT", Boom())
+    monkeypatch.setattr(pending, "_RETRY_AFTER", 0.0)
+    pending._fallback.clear()
+
+    assert pending.get(900, "intent") is None, "读失败不该抛出去"
+    assert pending._CLIENT is None, "坏连接必须被丢弃"
+    assert pending._RETRY_AFTER > 0, "必须进入冷却期"
+
+    pending.set(900, "intent", {"intent_id": "x"})
+    assert pending.get(900, "intent")["intent_id"] == "x", "冷却期内应落进程内存"
+    pending._fallback.clear()

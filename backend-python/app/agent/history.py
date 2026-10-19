@@ -8,6 +8,7 @@
 import json
 import logging
 import os
+import re
 import threading
 import time
 import uuid
@@ -25,6 +26,16 @@ _CURRENT = ROOT / "_current.json"
 # 若将来多实例部署，要换成文件锁，或干脆改成追加式存储（每轮一行 JSONL）。
 _LOCK = threading.Lock()
 
+# 会话 id 由 new_session 生成，形状固定。查询/删除接口的 session 来自 URL，
+# 直接拼进文件名等于把路径穿越的口子开着 —— Starlette 的 /{session} 默认不匹配 "/"，
+# 但百分号编码的 %2F 在部分版本会先解码再匹配路由。这里做白名单校验，
+# 形状不对的一律按"不存在"处理，不去碰文件系统。
+_SESSION_RE = re.compile(r"^s[0-9a-f]{10}$")
+
+
+def valid_session(session) -> bool:
+    return bool(_SESSION_RE.fullmatch(str(session or "")))
+
 
 def _atomic_write(p: Path, text: str) -> None:
     """先写临时文件再原子替换，避免进程在写到一半时中断留下半截 JSON。"""
@@ -34,6 +45,9 @@ def _atomic_write(p: Path, text: str) -> None:
 
 
 def _path(user_id, session):
+    """会话文件路径。session 形状非法时返回 None，调用方按"不存在"处理。"""
+    if not valid_session(session):
+        return None
     return ROOT / f"{user_id}_{session}.json"
 
 
@@ -81,7 +95,8 @@ def new_session(user_id) -> str:
 
 def activate(user_id, session) -> bool:
     """把某历史会话设为“当前”，之后续聊（档案+记忆）都落回该会话。"""
-    if not (ROOT / f"{user_id}_{session}.json").exists():
+    p = _path(user_id, session)
+    if p is None or not p.exists():
         return False
     _write_current(user_id, session)
     return True
@@ -94,6 +109,9 @@ def append_turn(user_id, user_text: str, assistant_text: str):
     _ensure_dir()
     session = current_session(user_id)
     p = _path(user_id, session)
+    if p is None:
+        logger.warning("当前会话 id 形状非法，本轮不归档：%s", session)
+        return
     with _LOCK:
         try:
             doc = json.loads(p.read_text(encoding="utf-8"))
@@ -129,6 +147,8 @@ def list_sessions(user_id) -> list[dict]:
 def delete_session(user_id, session):
     """删除单个历史会话文件与对应会话记忆；若删的是当前会话，同时清当前指向。"""
     p = _path(user_id, session)
+    if p is None:
+        return
     if p.exists():
         p.unlink()
     mem.clear(user_id, session)  # 会话级记忆一并清掉，避免孤儿桶
@@ -145,7 +165,7 @@ def delete_session(user_id, session):
 
 def get_session(user_id, session) -> list[dict]:
     p = _path(user_id, session)
-    if not p.exists():
+    if p is None or not p.exists():
         return []
     try:
         doc = json.loads(p.read_text(encoding="utf-8"))

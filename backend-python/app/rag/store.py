@@ -307,6 +307,12 @@ class RagStore:
         self._page_index = None  # 数据变了，关键词索引下次懒重建
 
     def count_by_source(self, source: str) -> int:
+        """该来源的向量条数。
+
+        注意口径：多部门可见的文档会按标签各插一份（见 ingest_file 的说明），
+        所以这个数对多标签文档是「段落数 × 标签数」。界面上叫"向量段落"，
+        数的是向量条数——口径本身就是这个，不改。
+        """
         return len(self._query_ids_by_source(source))
 
     def distinct_sources(self) -> set:
@@ -349,8 +355,8 @@ class RagStore:
             pages = load_pages(path)
         if not pages:
             return 0
-        if not meta:
-            meta = ["all"]
+        # 去重保序：同一部门写两遍（"dept_tags: 技术部, 技术部"）会让每个小块被插两份，纯属浪费
+        meta = list(dict.fromkeys(meta)) or ["all"]
 
         rows, pid = [], 0
         for page in pages:
@@ -358,8 +364,16 @@ class RagStore:
             smalls = chunk_sentences(page.text)
             if not smalls:
                 continue
-            vecs = await embed_texts(smalls)
+            vecs = await embed_texts(smalls)      # 嵌入只算一次，标签循环里复用
             parent = _clean(page.text)
+            # 一行只能带一个 dept_tags 值（字段是 VARCHAR，存不下数组），所以
+            # 「一篇文档对多个部门可见」只能按标签各插一份 —— **这是有意为之，不是 bug**。
+            # 代价：存储按标签数翻倍（当前演示语料每篇最多一个标签，实际没有翻倍）。
+            # 换来的是向量路能继续用精确等值过滤 'dept_tags in ["all","<本部门>"]'，
+            # 不必依赖 Milvus 的 like 通配 —— 后者在不同版本/后端上行为不一致，
+            # 一旦不支持就只在 retrieve() 的 except 里留一条 warning，静默退化成纯 BM25。
+            # 想彻底去掉冗余要把字段改成 ARRAY/JSON，那是 schema 变更：需删 data/rag.db 重灌
+            # （见本文件顶部说明），收益只有多标签文档的存储，暂不做。
             for tag in meta:
                 for small, vec in zip(smalls, vecs):
                     rows.append({

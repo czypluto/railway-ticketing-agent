@@ -11,7 +11,8 @@ app/
   security.py     JWT 解析（与 Java 共用 JWT_SECRET，HS256）
   llm.py          模型路由层：chat(task, ...)，统一 OpenAI 兼容协议
   java_client.py  REST 调 Java（只此一条执行通道）
-  tools.py        Agent 工具 schema（与 Java 的 /api/ticket、/api/user、/api/rail 接口人工对齐）
+  tools.py        Agent 工具 schema（与 Java 的 /api/ticket、/api/user 接口人工对齐；
+                  只读的车站/列车/车次都走 /api/ticket/**，不用 ADMIN-only 的 /api/rail/**）
   agent/          编排：每轮 RAG 注入 -> function-calling 循环 -> 工具调 Java
   rag/            Small-to-Big 检索 + 中文 BM25 + RRF（可选，需 pymilvus + 嵌入服务）
   embed/          本地嵌入服务（独立的 FastAPI 应用，端口 8001）
@@ -33,7 +34,7 @@ uvicorn app.main:app --port 8000
 
 | 方法 | 路径 | 说明 |
 |---|---|---|
-| POST | /api/chat | 对话（带 Token，SSE 流式返回 think/result/answer/confirm/error 事件） |
+| POST | /api/chat | 对话（带 Token，SSE 流式返回 think/tool/result/answer/confirm/error 事件） |
 | GET  | /api/health | 健康 + 当前模型路由（观察 dev/prod 切换是否生效） |
 | GET/POST/DELETE | /api/chat/history | 会话档案列表 / 详情 / 删除 / 新对话 |
 | GET/POST/DELETE | /api/kb | 知识库上传 / 重建 / 删除 |

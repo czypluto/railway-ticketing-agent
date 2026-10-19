@@ -3,7 +3,11 @@
 流程：每轮先做一次 RAG 检索，把【参考资料】注入上下文；再由模型以 function-calling
 循环决策——直接依据资料作答，或调用工具（查票/下单/支付/退票等）。
 
-改数据的动作不交给模型：buy_ticket 的 tripId 必须来自上一轮查票结果，下单走两阶段确认。
+改数据的动作不交给模型，四处落点：
+  1. buy_ticket 的 tripId 必须来自上一轮查票结果（`_find_trip`）；
+  2. 下单走两阶段确认，前端按钮带回 intent_id，由确定性代码 `_commit_buy` 执行；
+  3. pay_ticket / cancel_ticket 的 requestId 只认系统记下的订单（`_known_order_ids`）；
+  4. 政策判定一律在 Java 侧 TicketPolicy，模型只负责解释。
 """
 import asyncio
 import logging
@@ -86,6 +90,49 @@ def _event(kind: str, text: str, task: str = "agent") -> dict:
     return {"kind": kind, "text": text, "model": config.resolve_model(task)}
 
 
+class ToolArgError(Exception):
+    """工具调用缺少必填参数。"""
+
+
+def _req_arg(args: dict, name: str) -> str:
+    """取工具的必填字符串参数。
+
+    模型偶尔会漏传（尤其 requestId）。原先直接写 `args["requestId"]`：
+    漏传就抛 KeyError —— 它不是 JavaError，不会被分发处的 except 接住，
+    会一路冒到 chat.py 的兜底 except，用户只看到「处理出错：'requestId'」，
+    既不告诉他缺什么，也没说下一步做什么。实测就是这么复现的。
+    """
+    v = args.get(name)
+    if v is None or (isinstance(v, str) and not v.strip()):
+        raise ToolArgError(f"缺少必填参数 {name}")
+    return str(v).strip()
+
+
+def _intent_verdict(intent: dict, user_text: str, resume: Optional[dict]) -> str:
+    """这次输入该如何处置待确认的下单意向。
+
+    返回四选一：
+      execute —— 执行下单。结构化载荷 intent_id 对得上且 confirm 为真；
+                 或过渡期关键词命中（见 _intent_decision）。
+      cancel  —— 作废这次意向。载荷 intent_id 对得上但用户明确点了取消。
+      discard —— 作废这次意向。纯自然语言输入且没命中确认词，视为用户改了主意。
+      keep    —— **保留**意向。载荷的 intent_id 对不上（串话 / 过期 / 别的用途）。
+
+    keep 这一档是单独存在的理由：原实现对所有"没命中"的情况一律作废意向，
+    于是任意一次无关载荷（比如一个没有待支付单的支付载荷）都会把用户刚看到的
+    「确认下单」按钮悄悄废掉——再点就没反应，而用户不知道发生了什么。
+    只能作废"确实是冲这次意向来的"载荷。
+    """
+    if resume is not None:
+        rid = resume.get("intent_id")
+        # 必须是非空且相等才算"冲这笔意向来的"：写 `!=` 而不写 `==` 的话，
+        # 一个没有 intent_id 的载荷（rid 为 None）会与"意向也没有 id"的假想情况相等。
+        if not rid or rid != intent.get("intent_id"):
+            return "keep"
+        return "execute" if resume.get("confirm") else "cancel"
+    return "execute" if _intent_decision(intent, user_text, None) else "discard"
+
+
 def _find_trip(rows, trip_id):
     """从上一轮查票结果里取出 tripId 对应的行；取不到返回 None。
 
@@ -95,6 +142,28 @@ def _find_trip(rows, trip_id):
     if not rows:
         return None
     return next((r for r in rows if r.get("tripId") == trip_id), None)
+
+
+def _known_order_ids(uid) -> set[str]:
+    """系统记下的、用户这次会话里确实见过的订单号。
+
+    两个来源：刚下单拿到的 requestId（「支付」按钮走的就是它），以及最近一次
+    my_orders 列出的那些。pay_ticket / cancel_ticket 的 requestId **只认这里的**——
+    与 buy_ticket 的 tripId 必须来自查票结果是同一条防线。
+
+    原来的写法是直接把模型传的 requestId 交给 Java。Java 侧有归属校验，
+    付不了别人的单，但模型仍可以在用户没点确认的情况下，把该用户自己的订单付掉/退掉：
+    "写交易由模型参数驱动"这一点就漏在这儿。
+    """
+    ids: set[str] = set()
+    rid = pending.get(uid, "order")
+    if rid:
+        ids.add(str(rid))
+    for o in pending.get(uid, "orders") or []:
+        r = o.get("requestId")
+        if r:
+            ids.add(str(r))
+    return ids
 
 
 async def _safe_stations() -> list[dict]:
@@ -111,7 +180,9 @@ def _system_prompt() -> str:
         "你是铁路购票助手。今天是%s。\n"
         "处理顺序（务必遵守）：\n"
         "1. 规则/规定/知识类问题（退改签/儿童/学生/票价/携带行李等）先依据【参考资料】回答，资料覆盖就不要再调工具；资料未覆盖则明说“未查到相关规定”。\n"
-        "2. 业务操作（查票/购票/我的订单/订单详情/支付/退票/常用联系人/个人资料/列车车次车站列表等）调用工具走 Java 完成；退票等操作若不确定是哪张，先调 my_orders 列出再让用户确认 requestId。\n"
+        "2. 业务操作（查票/购票/我的订单/订单详情/支付/退票/常用联系人/个人资料/列车车次车站列表等）调用工具走 Java 完成；"
+        "支付与退票的 requestId 只能取自 my_orders 列出的订单或刚下单返回的那一笔，不得自行编造；"
+        "两者都没有时先调 my_orders 列出。\n"
         "3. 参考资料与可用工具都无法满足用户请求时，明确回答“我暂时无法办理/不清楚，请补充信息或联系人工”，绝不编造结论、车次或参数。\n"
         "必要参数缺失（如出发地/日期）时直接问用户缺什么。金额单位是分。说话简洁公文化。"
         % date.today().isoformat()
@@ -169,15 +240,22 @@ class AgentService:
             return
 
         intent = pending.get(uid, "intent")
-        if intent and _intent_decision(intent, user_text, resume):
-            # 用户确认：执行预填的下单（确定性路径，不再让模型介入）
-            pending.drop(uid, "intent")
-            async for ev in self._commit_buy(user, intent):
-                yield ev
-            return
         if intent:
-            # 用户改了主意 / 提了新请求：作废旧意向，落到下面按新请求处理
-            pending.drop(uid, "intent")
+            # 「这张载荷是不是冲这笔意向来的」与「要不要执行」是两件事，见 _intent_verdict
+            verdict = _intent_verdict(intent, user_text, resume)
+            if verdict in ("execute", "cancel"):
+                pending.drop(uid, "intent")   # 用掉即废：确认和取消都消费掉这次意向
+            if verdict == "execute":
+                # 用户确认：执行预填的下单（确定性路径，不再让模型介入）
+                async for ev in self._commit_buy(user, intent):
+                    yield ev
+                return
+            if verdict == "cancel":
+                yield _event("answer", "已取消本次下单。")
+                return
+            if verdict == "discard":
+                pending.drop(uid, "intent")   # 用户改了主意 / 提了新请求，按新请求处理
+            # verdict == "keep"：载荷不是冲这次意向来的，意向留着，落到下面的「失效」提示
 
         if resume is not None and not user_text.strip():
             # 结构化载荷没匹配上任何待办（多半是过期或串话过来的）。
@@ -287,13 +365,16 @@ class AgentService:
                         return
                     elif name == "my_orders":
                         rows = await java_client.my_orders()
+                        # 记下这次列出的订单：后续 pay_ticket / cancel_ticket 的 requestId
+                        # 只认这些（加上刚下单那笔），见 _known_order_ids
+                        pending.set(uid, "orders", rows)
                         shown = True
                         acted = True
                         text = self._orders_text(rows)
                         msgs.append({"role": "assistant", "content": f"我的订单：\n{text}"})
                         yield _event("result", text)
                     elif name == "order_detail":
-                        d = await java_client.order_detail(args["requestId"])
+                        d = await java_client.order_detail(_req_arg(args, "requestId"))
                         shown = True
                         acted = True
                         text = self._kv_text(d)
@@ -315,7 +396,7 @@ class AgentService:
                         yield _event("result", text)
                     elif name == "add_contact":
                         c = await java_client.add_contact(
-                            args["name"], args.get("idType"), args.get("idNo"),
+                            _req_arg(args, "name"), args.get("idType"), args.get("idNo"),
                             args.get("phone"), args.get("age"))
                         shown = True
                         acted = True
@@ -330,7 +411,11 @@ class AgentService:
                         msgs.append({"role": "assistant", "content": f"个人资料：\n{text}"})
                         yield _event("result", text)
                     elif name == "pay_ticket":
-                        rid = args["requestId"]
+                        rid = _req_arg(args, "requestId")
+                        # 支付取记忆：只认系统记下的订单，不接受模型传参
+                        if rid not in _known_order_ids(uid):
+                            yield _event("error", "没有可支付的订单。请先下单，或让我列出您的订单后再选择。")
+                            return
                         r = await java_client.pay(rid)
                         shown = True
                         acted = True
@@ -338,13 +423,21 @@ class AgentService:
                         msgs.append({"role": "assistant", "content": line})
                         yield _event("result", line)
                     elif name == "cancel_ticket":
-                        rid = args["requestId"]
+                        rid = _req_arg(args, "requestId")
+                        # 退票同样只认系统记下的订单：模型不能凭空点名一张订单退掉
+                        if rid not in _known_order_ids(uid):
+                            yield _event("error", "请先让我列出您的订单（my_orders），再从里面选择要退的那一张。")
+                            return
                         r = await java_client.cancel(rid)
                         shown = True
                         acted = True
                         line = f"订单 {rid} 已退票，状态 {r.get('status')}，余票已回补"
                         msgs.append({"role": "assistant", "content": line})
                         yield _event("result", line)
+                except ToolArgError as e:
+                    # 模型漏传必填参数：给可读提示，别让它变成"处理出错"的兜底 500
+                    yield _event("error", f"{name} 调用不完整（{e}），请补充信息后重试。")
+                    return
                 except java_client.JavaError as e:
                     yield _event("error", f"{e.msg}")
                     return
