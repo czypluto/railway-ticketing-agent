@@ -31,7 +31,6 @@ import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
-import java.time.Duration;
 import java.time.LocalDate;
 import java.time.LocalDateTime;
 import java.time.format.DateTimeFormatter;
@@ -65,6 +64,7 @@ public class TicketService {
     private final RateLimiter rateLimiter;
     private final DependencyCircuitBreaker breaker;
     private final TicketPolicy policy;
+    private final RailwayView view;
 
     public TicketService(TripRepository tripRepository,
                          TrainRepository trainRepository,
@@ -79,7 +79,8 @@ public class TicketService {
                          RedissonClient redisson,
                          RateLimiter rateLimiter,
                          DependencyCircuitBreaker breaker,
-                         TicketPolicy policy) {
+                         TicketPolicy policy,
+                         RailwayView view) {
         this.tripRepository = tripRepository;
         this.trainRepository = trainRepository;
         this.trainStopRepository = trainStopRepository;
@@ -94,6 +95,7 @@ public class TicketService {
         this.rateLimiter = rateLimiter;
         this.breaker = breaker;
         this.policy = policy;
+        this.view = view;
     }
 
     // ---------- 余票查询 ----------
@@ -143,6 +145,27 @@ public class TicketService {
         return list.stream()
                 .map(s -> Map.<String, Object>of("id", s.getId(), "code", s.getCode(), "name", s.getName()))
                 .toList();
+    }
+
+    /**
+     * 列车只读列表。管理端的 /api/rail/trains 是 ADMIN-only，Agent 的 list_trains 工具
+     * 对普通用户会 403 —— 这里给业务侧开一份，与 stations() 同理。
+     */
+    public List<Map<String, Object>> trains() {
+        return trainRepository.findAll().stream().map(view::trainView).toList();
+    }
+
+    /** 开行车次只读列表（可按日期或列车过滤）。同上，管理端 /api/rail/trips 是 ADMIN-only。 */
+    public List<Map<String, Object>> trips(LocalDate date, Long trainId) {
+        List<Trip> list;
+        if (trainId != null) {
+            list = tripRepository.findByTrainIdOrderByTravelDateDesc(trainId);
+        } else if (date != null) {
+            list = tripRepository.findByTravelDateOrderByTravelDateAsc(date);
+        } else {
+            list = tripRepository.findAll();
+        }
+        return list.stream().map(view::brief).toList();
     }
 
     // ---------- 下单 ----------
@@ -249,7 +272,7 @@ public class TicketService {
             // 一人一票活跃占位（车次级 SETNX 原子准入，防并发“先查后写”重复下单）
             String activeKey = RailwayKeys.active(user.userId(), trip.getId());
             Boolean acquired = breaker.call("redis", () -> redis.opsForValue().setIfAbsent(
-                    activeKey, "1", Duration.ofMinutes(30))); // 兜底租约；正常走 cancel/expire 显式释放
+                    activeKey, "1", TicketTiming.ACTIVE_LEASE)); // 兜底租约；正常走 cancel/expire 显式释放
             if (!Boolean.TRUE.equals(acquired)) {
                 throw new BizException(409, "您已购买该车次车票，一人一票，请勿重复购买");
             }
@@ -261,13 +284,21 @@ public class TicketService {
                 left = stockService.decr(trip.getId(), tc.getSeatClass());
             }
             if (left < 0) {
-                redis.delete(activeKey); // 没买到就释放占位
+                // 没买到就释放占位。走熔断器：与同方法内其它 Redis 调用一致，
+                // 免得 Redis 不可用时只有这一句抛出的异常类型与别处不同。
+                breaker.run("redis", () -> redis.delete(activeKey));
                 throw new BizException(409, "余票不足");
             }
 
-            // 座位分配：原子递增取号，已分配的座不会再给第二个用户
-            long seatNo = breaker.call("redis", () -> redis.opsForValue().increment(
-                    RailwayKeys.seatSeq(trip.getId(), tc.getSeatClass())));
+            // 座位分配：优先复用已释放的号，空闲集合为空才取新号。
+            // 单纯 INCR 会让号只增不减（退票只回补余票），反复买退后涨过总席位。
+            long seatNo = stockService.allocSeat(trip.getId(), tc.getSeatClass());
+            if (seatNo <= 0) {
+                // 取号失败：库存与占位都还回去，别让这次失败的尝试把票扣着
+                breaker.run("redis", () -> redis.delete(activeKey));
+                stockService.release(trip.getId(), tc.getSeatClass(), null);
+                throw new BizException(503, "座位号分配失败，请稍后重试");
+            }
 
             String from = name(stops.get(fromIdx).getStationId());
             String to = name(stops.get(toIdx).getStationId());
@@ -293,17 +324,22 @@ public class TicketService {
             // 必须写在 XADD 之前，这样 XADD 失败时也能立刻回补。
             String inflightKey = RailwayKeys.inflight(requestId);
             long nowMs = System.currentTimeMillis();
-            breaker.run("redis", () -> {
-                redis.opsForValue().set(inflightKey,
-                        trip.getId() + "|" + tc.getSeatClass() + "|" + user.userId() + "|" + nowMs,
-                        Duration.ofMinutes(15));
-                redis.opsForZSet().add(RailwayKeys.inflightIndex(), requestId, nowMs);
-            });
+            // 登记里带上座位号：对账补偿时要连座位号一起还回空闲集合（格式见 RailwayKeys.inflight）
+            final String inflightDetail =
+                    trip.getId() + "|" + tc.getSeatClass() + "|" + user.userId() + "|" + nowMs + "|" + seatNo;
+            // 在途登记与写 Stream **同一个 try**：任一失败都要把本次购买整体作废。
+            // 登记原先在 try 之外 —— 登记自己抛异常（Redis 抖动/熔断）时，
+            // 已扣的库存、占位、座位号没有任何补偿，且因为没有登记，对账任务也兜不住。
+            // 登记放在 XADD 之前，正是为了 XADD 失败时能连库存一起还回去。
             try {
+                breaker.run("redis", () -> {
+                    redis.opsForValue().set(inflightKey, inflightDetail, TicketTiming.INFLIGHT_TTL);
+                    redis.opsForZSet().add(RailwayKeys.inflightIndex(), requestId, nowMs);
+                });
                 breaker.run("redis", () ->
                         redis.opsForStream().add(RailwayKeys.orderStream(), event));
             } catch (RuntimeException e) {
-                // 写 Stream 失败 = 本次购买作废：占位、在途登记、**以及已扣的库存**都要还回去。
+                // 本次购买作废：占位、在途登记、已扣的库存**与座位号**都要还回去。
                 // （此前只释放了占位，扣掉的那张票会永久泄漏）
                 //
                 // 补偿是尽力而为：Redis 已经不可用时这些 delete 大概率同样失败。
@@ -313,7 +349,7 @@ public class TicketService {
                     redis.delete(activeKey);
                     redis.delete(inflightKey);
                     redis.opsForZSet().remove(RailwayKeys.inflightIndex(), requestId);
-                    stockService.release(trip.getId(), tc.getSeatClass());
+                    stockService.release(trip.getId(), tc.getSeatClass(), seatNo);
                 } catch (RuntimeException comp) {
                     log.warn("购票失败后的补偿未全部完成，交由在途对账兜底 requestId={}：{}",
                             requestId, comp.toString());
@@ -372,7 +408,8 @@ public class TicketService {
         order.setStatus(TicketOrder.CANCELLED);
         order.setCancelledAt(LocalDateTime.now());
         orderRepository.save(order);
-        stockService.release(order.getTripId(), order.getSeatClass());
+        stockService.release(order.getTripId(), order.getSeatClass(),
+                RailwayStockService.parseSeatNo(order.getSeatNo()));
         // 释放一人一票活跃占位，允许该用户之后重新购买同车次同席别
         redis.delete(RailwayKeys.active(order.getUserId(), order.getTripId()));
         log.info("退票 requestId={} 余票已回补", requestId);

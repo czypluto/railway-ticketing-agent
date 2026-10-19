@@ -66,6 +66,20 @@ public class TicketController {
         return ApiResult.ok(ticketService.stations(kw));
     }
 
+    @Operation(summary = "列车列表", description = "只读；供 Agent 的 list_trains 使用（管理端 /api/rail/trains 是 ADMIN-only，普通用户会 403）")
+    @GetMapping("/trains")
+    public ApiResult<List<Map<String, Object>>> trains() {
+        return ApiResult.ok(ticketService.trains());
+    }
+
+    @Operation(summary = "开行车次列表", description = "只读；供 Agent 的 list_trips 使用，可按日期或列车过滤")
+    @GetMapping("/trips")
+    public ApiResult<List<Map<String, Object>>> trips(
+            @RequestParam(required = false) @DateTimeFormat(iso = DateTimeFormat.ISO.DATE) LocalDate date,
+            @RequestParam(required = false) Long trainId) {
+        return ApiResult.ok(ticketService.trips(date, trainId));
+    }
+
     @Operation(summary = "购票", description = "锁定库存并生成待支付订单（幂等，同人同车次同席别防重复）")
     @PostMapping("/buy")
     public ApiResult<Map<String, Object>> buy(@Valid @RequestBody TicketService.BuyRequest req) {

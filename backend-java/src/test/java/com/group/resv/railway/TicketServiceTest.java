@@ -83,14 +83,16 @@ class TicketServiceTest {
     }
 
     @Test
-    void cancel_paid_releases_stock() {
+    void cancel_paid_releases_stock_and_seat_no() {
         TicketOrder o = order("r-cancel", TicketOrder.PAID, 7L);
+        o.setSeatNo("12");
         when(orderRepository.findByRequestId("r-cancel")).thenReturn(Optional.of(o));
 
         Map<String, Object> res = ticketService.cancel("r-cancel", 7L);
 
         assertEquals(TicketOrder.CANCELLED, res.get("status"));
-        verify(stockService).release(2L, "二等座");
+        // 余票与座位号必须一起还回去：只还余票会让座位号只增不减，最终涨过总席位
+        verify(stockService).release(2L, "二等座", 12L);
         verify(orderRepository).save(o);
     }
 

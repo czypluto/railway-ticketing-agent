@@ -31,8 +31,9 @@ public class TicketInflightReconcileJob {
     private static final Logger log = LoggerFactory.getLogger(TicketInflightReconcileJob.class);
 
     /** 宽限期：远大于正常消费延迟（毫秒级），避免把"正在处理中"误判成失败。 */
-    private static final Duration GRACE = Duration.ofMinutes(3);
-    private static final Duration KEEP = Duration.ofHours(1);
+    private static final Duration GRACE = TicketTiming.INFLIGHT_GRACE;
+    /** 墓碑保留时间：要活到迟到事件出现为止（约束见 {@link TicketTiming}）。 */
+    private static final Duration KEEP = TicketTiming.TOMBSTONE_KEEP;
     private static final String TOMBSTONE = "cancelled";
 
     private final StringRedisTemplate redis;
@@ -75,12 +76,15 @@ public class TicketInflightReconcileJob {
         String[] p = detail.split("\\|");
         Long tripId;
         Long userId;
+        Long seatNo;
         try {
             if (p.length < 4) {
                 throw new IllegalArgumentException("字段数不足：" + detail);
             }
             tripId = Long.valueOf(p[0]);
             userId = Long.valueOf(p[2]);
+            // 第 5 段是座位号，晚于前四段引入；老登记没有它，按"未分配"处理（向后兼容）
+            seatNo = p.length >= 5 ? RailwayStockService.parseSeatNo(p[4]) : null;
         } catch (RuntimeException e) {
             log.warn("在途购票 {} 登记内容不合法（{}），摘除索引且不回补：{}", requestId, detail, e.getMessage());
             redis.opsForZSet().remove(RailwayKeys.inflightIndex(), requestId);
@@ -97,16 +101,17 @@ public class TicketInflightReconcileJob {
                 redis.opsForZSet().remove(RailwayKeys.inflightIndex(), requestId);
                 return;
             }
-            stockService.release(tripId, seatClass);
+            stockService.release(tripId, seatClass, seatNo);
             redis.delete(RailwayKeys.active(userId, tripId));
             redis.opsForZSet().remove(RailwayKeys.inflightIndex(), requestId);
 
             // 收尾再核对一次：兜住极窄窗口——消费端在我判 DB（无单）之后、
             // 墓碑真正生效之前把订单插了进去。若不撤销，会变成「订单存在、余票却多一张」。
             if (orderRepository.findByRequestId(requestId).isPresent()) {
-                stockService.decr(tripId, seatClass);
+                // reclaim 连座位号一起收回，否则那个号已进空闲池，会被下一单复用 → 一号两用
+                stockService.reclaim(tripId, seatClass, seatNo);
                 redis.opsForValue().setIfAbsent(
-                        RailwayKeys.active(userId, tripId), "1", KEEP);
+                        RailwayKeys.active(userId, tripId), "1", TicketTiming.ACTIVE_LEASE);
                 log.warn("在途购票 {} 在对账瞬间落库成功，已撤销回补并恢复一人一票占位", requestId);
             } else {
                 log.error("在途购票 {} 超过 {} 分钟仍未落库，已回补余票并释放占位（异步落库失败补偿）",

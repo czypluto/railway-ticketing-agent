@@ -20,9 +20,18 @@ public final class RailwayKeys {
         return "rv:active:" + userId + ":" + tripId;
     }
 
-    /** 座位号分配（每车次每席别独立原子递增，已分配的座不再给他人）。 */
+    /** 座位号递增序列（每车次每席别独立；空闲集合为空时才取新号）。 */
     public static String seatSeq(Long tripId, String seatClass) {
         return "rv:seat:" + tripId + ":" + seatClass;
+    }
+
+    /**
+     * 已释放、可复用的座位号集合（每车次每席别一个）。
+     * 退票/过期/对账补偿时把号还回来，下次分配优先取用，
+     * 使在用的座位号始终落在 [1, 总席位] 内（否则序列只增不减，会一路涨过总席位）。
+     */
+    public static String seatFree(Long tripId, String seatClass) {
+        return "rv:seatfree:" + tripId + ":" + seatClass;
     }
 
     /**
@@ -34,9 +43,12 @@ public final class RailwayKeys {
     }
 
     /**
-     * 单笔在途购票详情：`tripId|seatClass|userId|下单毫秒`。
+     * 单笔在途购票详情：`tripId|seatClass|userId|下单毫秒|座位号`。
      * 消费端落库成功后删除；对账任务判定投递失败后改写为 `cancelled` 墓碑，
      * 消费端据此丢弃迟到的事件，防止"补偿完又被插进来"。
+     *
+     * <p>座位号是后加的第五个字段：对账补偿时要连座位号一起还回空闲集合。
+     * 老登记（4 段）仍能被解析，只是座位号视为缺失——解析保持向后兼容。
      */
     public static String inflight(String requestId) {
         return "rv:inflight:" + requestId;

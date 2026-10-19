@@ -20,9 +20,6 @@ public class TicketExpireJob {
 
     private static final Logger log = LoggerFactory.getLogger(TicketExpireJob.class);
 
-    /** 待支付时限：从**下单时刻**起算（事件里带的下单时间戳），不是从落库时刻起算。 */
-    private static final int PAY_WINDOW_MINUTES = 10;
-
     private final TicketExpireService expireService;
     private final RailwayStockService stockService;
     private final StringRedisTemplate redis;
@@ -37,14 +34,15 @@ public class TicketExpireJob {
     @Scheduled(fixedDelay = 60_000)
     public void expirePending() {
         for (Long orderId : expireService.findStaleIds(
-                LocalDateTime.now().minusMinutes(PAY_WINDOW_MINUTES))) {
+                LocalDateTime.now().minus(TicketTiming.PAY_WINDOW))) {
             try {
                 // 只有本次确实改成 EXPIRED 才回补；被支付/退票抢先则返回 null，不能回补
                 TicketOrder expired = expireService.tryExpire(orderId);
                 if (expired == null) {
                     continue;
                 }
-                stockService.release(expired.getTripId(), expired.getSeatClass());
+                stockService.release(expired.getTripId(), expired.getSeatClass(),
+                        RailwayStockService.parseSeatNo(expired.getSeatNo()));
                 redis.delete(RailwayKeys.active(expired.getUserId(), expired.getTripId()));
                 log.info("订单 {} 超时未支付，已过期并回补余票、释放占位", expired.getRequestId());
             } catch (Exception e) {

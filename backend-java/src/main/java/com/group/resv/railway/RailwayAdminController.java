@@ -48,19 +48,22 @@ public class RailwayAdminController {
     private final TripRepository tripRepository;
     private final TripClassRepository tripClassRepository;
     private final AdminConfirmService adminConfirm;
+    private final RailwayView view;
 
     public RailwayAdminController(TrainRepository trainRepository,
                                   StationRepository stationRepository,
                                   TrainStopRepository trainStopRepository,
                                   TripRepository tripRepository,
                                   TripClassRepository tripClassRepository,
-                                  AdminConfirmService adminConfirm) {
+                                  AdminConfirmService adminConfirm,
+                                  RailwayView view) {
         this.trainRepository = trainRepository;
         this.stationRepository = stationRepository;
         this.trainStopRepository = trainStopRepository;
         this.tripRepository = tripRepository;
         this.tripClassRepository = tripClassRepository;
         this.adminConfirm = adminConfirm;
+        this.view = view;
     }
 
     // ---------- 高危操作二次确认 ----------
@@ -106,8 +109,8 @@ public class RailwayAdminController {
     }
 
     @GetMapping("/trains")
-    public ApiResult<List<Train>> trains() {
-        return ApiResult.ok(trainRepository.findAll());
+    public ApiResult<List<Map<String, Object>>> trains() {
+        return ApiResult.ok(trainRepository.findAll().stream().map(view::trainView).toList());
     }
 
     @PostMapping("/trains")
@@ -172,7 +175,7 @@ public class RailwayAdminController {
     @GetMapping("/trains/{id}/stops")
     public ApiResult<List<Map<String, Object>>> trainStops(@PathVariable Long id) {
         trainRepository.findById(id).orElseThrow(() -> new BizException(404, "车次不存在"));
-        return ApiResult.ok(stopViews(id));
+        return ApiResult.ok(view.stopViews(id));
     }
 
     // ---------- 运行日 + 席别 ----------
@@ -218,13 +221,13 @@ public class RailwayAdminController {
         } else {
             list = tripRepository.findAll();
         }
-        return ApiResult.ok(list.stream().map(this::brief).toList());
+        return ApiResult.ok(list.stream().map(view::brief).toList());
     }
 
     @GetMapping("/trips/{id}")
     public ApiResult<Map<String, Object>> tripDetail(@PathVariable Long id) {
         Trip trip = tripRepository.findById(id).orElseThrow(() -> new BizException(404, "车次不存在"));
-        return ApiResult.ok(detail(trip));
+        return ApiResult.ok(view.detail(trip));
     }
 
     @DeleteMapping("/trips/{id}")
@@ -234,48 +237,6 @@ public class RailwayAdminController {
         tripClassRepository.deleteAll(tripClassRepository.findByTripIdOrderByIdAsc(id));
         tripRepository.deleteById(id);
         return ApiResult.ok();
-    }
-
-    private Map<String, Object> brief(Trip t) {
-        Train train = trainRepository.findById(t.getTrainId()).orElse(null);
-        Map<String, Object> m = new java.util.HashMap<>();
-        m.put("id", t.getId());
-        m.put("travelDate", t.getTravelDate());
-        m.put("status", t.getStatus());
-        m.put("trainId", t.getTrainId());
-        m.put("trainCode", train == null ? null : train.getCode());
-        return m;
-    }
-
-    private Map<String, Object> detail(Trip trip) {
-        Train train = trainRepository.findById(trip.getTrainId()).orElse(null);
-        List<Map<String, Object>> classes = tripClassRepository.findByTripIdOrderByIdAsc(trip.getId()).stream()
-                .map(c -> Map.<String, Object>of("seatClass", c.getSeatClass(),
-                        "priceCents", c.getPriceCents(), "totalSeats", c.getTotalSeats()))
-                .toList();
-        List<Map<String, Object>> stops = stopViews(trip.getTrainId());
-        Map<String, Object> m = new java.util.HashMap<>();
-        m.put("tripId", trip.getId());
-        m.put("travelDate", trip.getTravelDate());
-        m.put("trainCode", train == null ? null : train.getCode());
-        m.put("classes", classes);
-        m.put("stops", stops);
-        return m;
-    }
-
-    /** 经停序列视图。用 HashMap 而非 Map.of——首站的到达时间本来就可以为 null，Map.of 遇到 null 会抛 NPE。 */
-    private List<Map<String, Object>> stopViews(Long trainId) {
-        return trainStopRepository.findByTrainIdOrderBySeqAsc(trainId).stream()
-                .map(st -> {
-                    Station s = stationRepository.findById(st.getStationId()).orElse(null);
-                    Map<String, Object> m = new java.util.HashMap<>();
-                    m.put("seq", st.getSeq());
-                    m.put("stationId", st.getStationId());
-                    m.put("station", s == null ? String.valueOf(st.getStationId()) : s.getName());
-                    m.put("arrive", st.getArriveTime() == null ? null : st.getArriveTime().toString());
-                    m.put("depart", st.getDepartTime() == null ? null : st.getDepartTime().toString());
-                    return m;
-                }).toList();
     }
 
     private LocalTime parse(String s) {

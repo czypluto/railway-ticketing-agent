@@ -23,17 +23,20 @@ public class RailwayStockService {
 
     private final StringRedisTemplate redis;
     private final DefaultRedisScript<Long> stockDecrScript;
+    private final DefaultRedisScript<Long> seatAllocScript;
     private final TripClassRepository tripClassRepository;
     private final TicketOrderRepository orderRepository;
     private final DependencyCircuitBreaker breaker;
 
     public RailwayStockService(StringRedisTemplate redis,
                                DefaultRedisScript<Long> stockDecrScript,
+                               DefaultRedisScript<Long> seatAllocScript,
                                TripClassRepository tripClassRepository,
                                TicketOrderRepository orderRepository,
                                DependencyCircuitBreaker breaker) {
         this.redis = redis;
         this.stockDecrScript = stockDecrScript;
+        this.seatAllocScript = seatAllocScript;
         this.tripClassRepository = tripClassRepository;
         this.orderRepository = orderRepository;
         this.breaker = breaker;
@@ -82,8 +85,23 @@ public class RailwayStockService {
         return r == null ? -2 : r;
     }
 
-    /** 退票回补一张，不超总席位。 */
-    public void release(Long tripId, String seatClass) {
+    /**
+     * 座位号分配：优先复用已释放的号，空闲集合为空时才取新号（见 lua/seat_alloc.lua）。
+     * 返回 0 表示分配失败（Redis 不可用），调用方按"取不到号"处理。
+     */
+    public long allocSeat(Long tripId, String seatClass) {
+        Long n = breaker.call("redis", () -> redis.execute(seatAllocScript,
+                List.of(RailwayKeys.seatFree(tripId, seatClass), RailwayKeys.seatSeq(tripId, seatClass))));
+        return n == null ? 0L : n;
+    }
+
+    /**
+     * 退票/过期/补偿：回补一张余票，并把座位号还回空闲集合供复用。不超总席位。
+     *
+     * <p>余票与座位号一起释放，是为了不让调用方有"只还了余票、忘还座位号"的机会——
+     * 漏还不会报错，只会让座位号慢慢涨过总席位。
+     */
+    public void release(Long tripId, String seatClass, Long seatNo) {
         String key = RailwayKeys.stock(tripId, seatClass);
         breaker.run("redis", () -> {
             String v = redis.opsForValue().get(key);
@@ -97,5 +115,40 @@ public class RailwayStockService {
                 redis.opsForValue().increment(key);
             }
         });
+        releaseSeat(tripId, seatClass, seatNo);
+    }
+
+    /** 座位号入空闲池。用 SADD（幂等）：重复释放不会把同一个号放进去两次，去重也就不会一号两用。 */
+    public void releaseSeat(Long tripId, String seatClass, Long seatNo) {
+        if (seatNo == null) {
+            return;
+        }
+        breaker.run("redis", () -> redis.opsForSet().add(
+                RailwayKeys.seatFree(tripId, seatClass), String.valueOf(seatNo)));
+    }
+
+    /**
+     * 撤销一次释放：对账任务判定后又发现订单其实落库成功时，
+     * 把余票扣回去、座位号也从空闲集合收回，否则会变成"订单在、余票多一张、号也可能被复用"。
+     */
+    public void reclaim(Long tripId, String seatClass, Long seatNo) {
+        decr(tripId, seatClass);
+        if (seatNo == null) {
+            return;
+        }
+        breaker.run("redis", () -> redis.opsForSet().remove(
+                RailwayKeys.seatFree(tripId, seatClass), String.valueOf(seatNo)));
+    }
+
+    /** 座位号在库里是字符串（历史原因）。解析失败按"未分配"处理，不阻断退票主流程。 */
+    public static Long parseSeatNo(String seatNo) {
+        if (seatNo == null || seatNo.isBlank()) {
+            return null;
+        }
+        try {
+            return Long.parseLong(seatNo.trim());
+        } catch (NumberFormatException e) {
+            return null;
+        }
     }
 }

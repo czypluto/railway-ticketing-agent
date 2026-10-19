@@ -25,11 +25,18 @@
 | 方法 | 路径 | 说明 |
 |---|---|---|
 | GET  | `/api/ticket/query` | 余票查询（Python/Agent 查票调用） |
+| GET  | `/api/ticket/stations` | 车站只读列表（供 Agent 把站名解析为 stationId） |
+| GET  | `/api/ticket/trains` | 列车只读列表（供 Agent 的 `list_trains`） |
+| GET  | `/api/ticket/trips` | 开行车次只读列表，可按 `date` / `trainId` 过滤 |
 | POST | `/api/ticket/buy` | 下单（返回 requestId，异步落库） |
 | POST | `/api/ticket/orders/{requestId}/pay` | 支付 |
 | POST | `/api/ticket/orders/{requestId}/cancel` | 退票 |
 | GET  | `/api/ticket/orders/my` | 我的订单 |
 | GET  | `/api/ticket/orders/request/{requestId}` | 按 requestId 查订单 |
+
+> 这几个只读接口是给 Agent 用的：管理端的 `/api/rail/**` 是 ADMIN-only，
+> 普通用户的 token 会拿 403，而 Agent 的工具要服务于所有登录用户。
+> 视图拼装与管理端共用 `railway/RailwayView`，避免两边各写一份后结构漂移。
 
 **用户资料**
 

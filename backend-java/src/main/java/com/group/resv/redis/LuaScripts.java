@@ -23,4 +23,12 @@ public class LuaScripts {
         s.setResultType(Long.class);
         return s;
     }
+
+    @Bean
+    public DefaultRedisScript<Long> seatAllocScript() {
+        DefaultRedisScript<Long> s = new DefaultRedisScript<>();
+        s.setLocation(new ClassPathResource("lua/seat_alloc.lua"));
+        s.setResultType(Long.class);
+        return s;
+    }
 }
