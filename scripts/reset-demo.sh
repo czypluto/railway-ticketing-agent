@@ -31,7 +31,7 @@ docker exec resv-redis redis-cli EVAL "
     end
   end
   return n
-" 0 'rv:stock:*' 'rv:seat:*' 'rv:active:*' 'rv:inflight:*' \
+" 0 'rv:stock:*' 'rv:seat:*' 'rv:seatfree:*' 'rv:active:*' 'rv:inflight:*' \
     'resv:rate:*' 'mem:agent:*' 'resv:agent:*' >/dev/null
 
 # 清掉流里积压的事件，但保留流与消费组（XTRIM 不动 group）

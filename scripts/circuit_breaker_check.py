@@ -121,7 +121,7 @@ def reset(user: str) -> None:
                     "-e", f"use resv; delete o from ticket_order o join sys_user u "
                           f"on o.user_id=u.id where u.username='{user}';"],
                    capture_output=True)
-    for pattern in ("rv:active:*", "rv:stock:*", "rv:seat:*"):
+    for pattern in ("rv:active:*", "rv:stock:*", "rv:seat:*", "rv:seatfree:*"):
         keys = docker("exec", REDIS_CONTAINER, "redis-cli", "KEYS", pattern).split()
         if keys:
             docker("exec", REDIS_CONTAINER, "redis-cli", "DEL", *keys)

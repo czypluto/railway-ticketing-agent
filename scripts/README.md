@@ -85,7 +85,7 @@ python scripts/circuit_breaker_check.py      # 会 stop/start resv-redis
 
 | 脚本 | 作用 |
 |---|---|
-| `agent_eval/run.py` | 断言 Agent **行为**：工具轨迹、是否出票、是否拒绝（18 用例 / 6 类） |
+| `agent_eval/run.py` | 断言 Agent **行为**：工具轨迹、是否出票、是否拒绝（23 用例 / 6 类；2026-10-17 实测 22/23，唯一失败是模型轨迹波动） |
 | `agent_eval/cases.jsonl` | 用例集，加一行即可扩用例 |
 
 和 `rag_eval/` 的分工：那边测检索**质量**（Hit@K / MRR / RAGAS），
