@@ -46,14 +46,16 @@ function makeHandlers(current) {
       current.tone = 'normal'
       // 结构化确认：存下 intent_id，由「确认下单 / 取消」按钮原样回传
       if (ev.intent_id) current.intentId = ev.intent_id
-      // 下单成功后后端带回 requestId，据此渲染「支付」按钮（同样不打字）
-      if (ev.pay_request_id) current.payRequestId = ev.pay_request_id
     } else if (ev.kind === 'result' || ev.kind === 'answer') {
       current.stage = ''
       // 追加而非覆盖，避免后续事件把查询结果冲掉
       current.text = current.text ? `${current.text}\n${ev.text}` : ev.text
       current.tone = ev.kind === 'result' ? 'success' : 'normal'
     }
+    // 下单成功后后端**在 result 事件上**带回 requestId，据此渲染「支付」按钮（不必让用户打字）。
+    // 这一行原先写在 confirm 分支里，于是整页助手的支付按钮永远不出现 ——
+    // 文案说着"请在下方完成支付"，按钮却没有；浮窗（AgentFloat）写在分支外所以正常。
+    if (ev.pay_request_id) current.payRequestId = ev.pay_request_id
     current.model = ev.model || current.model
     scrollBottom()
   }

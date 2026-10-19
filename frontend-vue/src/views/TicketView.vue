@@ -1,7 +1,7 @@
 <script setup>
 import { onMounted, reactive, ref } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
-import { buyTicket, listContacts, listStations, payOrder, queryTickets } from '../api'
+import { buyTicket, listContacts, listStations, localDate, payOrder, queryTickets } from '../api'
 
 const props = defineProps({ user: { type: Object, required: true } })
 
@@ -13,7 +13,7 @@ const loading = ref(false)
 const form = reactive({
   from: null,
   to: null,
-  date: new Date(Date.now() + 86400000).toISOString().slice(0, 10),
+  date: localDate(1),
   seatClass: ''
 })
 

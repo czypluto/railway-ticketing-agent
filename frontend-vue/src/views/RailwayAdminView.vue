@@ -5,6 +5,7 @@
 import { onMounted, reactive, ref } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import {
+  localDate,
   railAddStation, railAddTrain, railCreateTrip, railDeleteTrain, railDeleteTrip,
   railSaveStops, railStations, railTrainStops, railTrains, railTripDetail, railTrips, railUpdateTrain
 } from '../api'
@@ -178,7 +179,7 @@ async function loadTrips() {
 
 function openTripDialog() {
   tripForm.trainId = ''
-  tripForm.travelDate = new Date(Date.now() + 86400000).toISOString().slice(0, 10)
+  tripForm.travelDate = localDate(1)
   tripForm.classes = [{ seatClass: '二等座', yuan: 553, totalSeats: 600 }]
   tripDialog.value = true
 }

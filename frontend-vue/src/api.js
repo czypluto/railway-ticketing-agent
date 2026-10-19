@@ -1,6 +1,19 @@
 // 与两个后端的通信。Java 登录/购票，Python 对话（SSE）。
 const TOKEN_KEY = 'resv_token'
 
+/**
+ * 本地时区的 YYYY-MM-DD。offsetDays=0 为今天，1 为明天。
+ *
+ * 不能用 `new Date(Date.now() + d).toISOString().slice(0,10)`：toISOString 走 UTC，
+ * 东八区在本地 08:00 之前拿到的还是前一天，"明天"会被预填成今天。
+ */
+export function localDate(offsetDays = 0) {
+  const d = new Date()
+  d.setDate(d.getDate() + offsetDays)
+  const p = (n) => String(n).padStart(2, '0')
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}`
+}
+
 const USER_KEY = 'resv_user'
 
 async function jfetch(path, options = {}) {
